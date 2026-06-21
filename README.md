@@ -48,6 +48,10 @@ All webhook agent comments are signed with `- Love Maeve`.
 
 The sidecar reads environment variables securely to perform actions and authenticate webhook requests.
 
+### Local `.env` Support (Highest Priority)
+You can place a `.env` file inside the `sidecars/trello-webhook-receiver/` directory (or the directory where the service is started). Variables defined here take precedence and overwrite variables loaded from systemd environments or `~/.zshrc`.
+- `TRELLO_AGENT_SIGNATURE_NAME`: Configure the name used by the agent to sign its Trello comments (e.g. `TRELLO_AGENT_SIGNATURE_NAME=Maeve`). Defaults to `Agy`.
+
 ### Trello Authentication
 To communicate with Trello, the service automatically injects the following keys from `~/.zshrc` when running under systemd:
 - `TRELLO_API_KEY`
@@ -55,7 +59,7 @@ To communicate with Trello, the service automatically injects the following keys
 - `TRELLO_SECRET` / `TRELLO_TOKEN`
 
 ### Webhook & Workspace Rules
-These are configured inside the systemd service file:
+These can be configured in your `.env` or inside the systemd service file:
 - `TRELLO_WEBHOOK_TOKEN`: A secure token to authenticate incoming HTTP POST payloads. Must be provided in the headers (`X-Auth-Token` or `Authorization`).
 - `TRELLO_AGENT_WORKSPACES`: A comma-separated list of paths pointing to the target directories. The agent is pinned to these directories during execution. Example:
   ```bash

@@ -32,6 +32,37 @@ def load_zshrc_env():
 
 load_zshrc_env()
 
+def load_dotenv():
+    # Look for .env in the script's directory and current working directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, ".env"),
+        os.path.join(os.getcwd(), ".env")
+    ]
+    import re
+    for dotenv_path in candidates:
+        if os.path.exists(dotenv_path):
+            try:
+                with open(dotenv_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        # Ignore comments and empty lines
+                        if not line or line.startswith("#"):
+                            continue
+                        match = re.match(r'^(?:export\s+)?([\w_]+)\s*=\s*(.*)$', line)
+                        if match:
+                            key = match.group(1)
+                            value = match.group(2).strip().strip('"').strip("'")
+                            os.environ[key] = value
+                            logging.info(f"[Trello Sidecar] Loaded/Overwrote {key} from {dotenv_path}")
+            except Exception as e:
+                logging.error(f"[Trello Sidecar] Error parsing dotenv file {dotenv_path}: {e}")
+
+load_dotenv()
+
+# 5. Agent signature name configuration
+AGENT_SIGNATURE_NAME = os.environ.get("TRELLO_AGENT_SIGNATURE_NAME", "Agy")
+
 def resolve_agy_bin():
     agy_bin = shutil.which("agy")
     if agy_bin:
@@ -185,7 +216,7 @@ async def trigger_agent(card_key, card_name, payload):
             "3. Link the created GitHub issues back to the Trello card.\n"
             "4. If labels are available, remove the 'Ready for Spec' label on the Trello card and add the 'Ready for Implementation' label.\n"
             "5. Relate specs to each other as appropriate, especially if there's both a FE and BE ticket as a result of the request.\n"
-            "6. Sign any card updates/comments with \"- Love Maeve\".\n\n"
+            f"6. Sign any card updates/comments with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             "### Planning & Spec Rules\n\n"
             "Before writing any spec, plan or code, search the existing codebase first.\n\n"
             "#### Search Before You Build\n"
@@ -231,7 +262,7 @@ async def trigger_agent(card_key, card_name, payload):
             "3. Suggest possible approaches: a quick/easy version (reusing existing components), an ideal version, and a compromise.\n"
             "4. Ask targeted, simple questions to grill the user on these options.\n"
             "5. Keep language extremely simple, non-technical, and brief. Avoid verbosity and technical jargon unless explicitly asked. Use short sentences and bullet points.\n"
-            "6. Post your response as a comment on the Trello card, tagging members using '@' for specific replies. Sign with \"- Love Maeve\".\n"
+            f"6. Post your response as a comment on the Trello card, tagging members using '@' for specific replies. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n"
         )
     else:
         model_name = "Gemini 3.5 Flash (Medium)"
@@ -242,7 +273,7 @@ async def trigger_agent(card_key, card_name, payload):
             "This is a General Discussion trigger. The comment is conversational, seeking general feedback/ideas or asking general questions:\n"
             "1. Respond constructively and collaboratively as appropriate.\n"
             "2. Keep language simple, non-technical, and scannable.\n"
-            "3. Post your response as a comment on the Trello card. Sign with \"- Love Maeve\".\n"
+            f"3. Post your response as a comment on the Trello card. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n"
         )
 
     # Load existing session map
