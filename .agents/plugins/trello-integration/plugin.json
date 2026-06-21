@@ -1,0 +1,9 @@
+{
+  "name": "trello-integration-plugin",
+  "version": "1.0.0",
+  "description": "Integrates Trello board automations with the Antigravity agent loop.",
+  "dependencies": [],
+  "entrypoints": {
+    "sidecars": ["sidecars/trello-webhook-receiver"]
+  }
+}

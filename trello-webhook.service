@@ -1,0 +1,17 @@
+[Unit]
+Description=Trello Webhook Receiver Sidecar Service
+After=network.target
+
+[Service]
+Type=simple
+# Set a secure random string here to authorize incoming webhooks
+Environment="TRELLO_WEBHOOK_TOKEN=your-secure-webhook-token"
+# Comma-separated paths of the codebase directories the agent is permitted to work on
+Environment="TRELLO_AGENT_WORKSPACES=/home/ubuntu/remote-hunter/remote-hunter-backend,/home/ubuntu/remote-hunter/remote-hunter-frontend"
+# Absolute path to the server.py entrypoint
+ExecStart=/usr/bin/python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

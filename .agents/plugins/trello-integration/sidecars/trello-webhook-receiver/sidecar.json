@@ -1,0 +1,7 @@
+{
+  "name": "trello-webhook-receiver",
+  "description": "Exposes an HTTP port to receive Trello automation POST webhooks and trigger local agent cycles.",
+  "command": "/usr/bin/python3",
+  "args": ["server.py"],
+  "restart_policy": "always"
+}
