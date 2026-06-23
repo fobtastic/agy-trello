@@ -716,24 +716,41 @@ class WebhookHandler(BaseHTTPRequestHandler):
             comment = payload.get("comment")
             
             # Fallback for raw Trello webhook structure
-            if (not card_id or not str(card_id).strip()) and "action" in payload:
-                card_data = payload.get("action", {}).get("data", {}).get("card", {})
-                card_id = card_data.get("id")
-                card_name = card_data.get("name", "Unnamed Card")
-                card_desc = card_data.get("desc", "")
-                card_link = card_data.get("shortUrl", "")
-                list_name = payload.get("action", {}).get("data", {}).get("list", {}).get("name", "")
-                
+            if "action" in payload:
                 action_data = payload.get("action", {})
+                card_data = action_data.get("data", {}).get("card", {})
+                if card_data:
+                    card_id = card_data.get("id") or card_id
+                    card_name = card_data.get("name") or card_name
+                    card_desc = card_data.get("desc") or card_desc
+                    card_link = card_data.get("shortUrl") or card_link
+                list_data = action_data.get("data", {}).get("list", {})
+                if list_data:
+                    list_name = list_data.get("name") or list_name
                 if action_data.get("type") == "commentCard":
-                    comment = action_data.get("data", {}).get("text", "")
+                    comment = action_data.get("data", {}).get("text") or comment
+
+            card_key = card_id or card_name or "Unnamed Card"
+            card_name_str = card_name or "Unnamed Card"
+
+            # Prevent loop: ignore webhooks triggered by the agent's own comments/acknowledgements
+            if comment:
+                bot_signatures = [
+                    f"- Love {AGENT_SIGNATURE_NAME}",
+                    "- Love INVESTIGATOR",
+                    "- Love PLANNER"
+                ]
+                if any(sig in comment for sig in bot_signatures):
+                    logging.info(f"[Trello Sidecar] Ignoring webhook triggered by agent's own comment on card '{card_name_str}'")
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ignored", "reason":"agent_own_comment"}')
+                    return
             
             # Ensure the resolved card ID is injected back into the payload so the agent can use it
             if card_id:
                 payload["cardId"] = card_id
-            
-            card_key = card_id or card_name or "Unnamed Card"
-            card_name_str = card_name or "Unnamed Card"
             
             # Enqueue the webhook payload for concurrent background execution
             logging.info(f"[Trello Sidecar] Enqueueing agent trigger for card: '{card_name_str}'")
