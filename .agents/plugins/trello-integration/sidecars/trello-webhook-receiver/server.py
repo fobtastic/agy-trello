@@ -345,6 +345,7 @@ async def trigger_agent(card_key, card_name, payload):
     # Try to fetch live card details from Trello
     card_id = payload.get("cardId")
     card_details_str = ""
+    latest_comment_action = None
     if card_id:
         loop = asyncio.get_running_loop()
         card_data = await loop.run_in_executor(None, fetch_card_details_sync, card_id)
@@ -357,13 +358,51 @@ async def trigger_agent(card_key, card_name, payload):
                 list_name = card_data["list"].get("name", list_name)
             
             # If no triggering comment is provided in payload, fall back to the latest comment on the card
-            if not comment:
-                actions = card_data.get("actions", [])
-                comment_actions = [a for a in actions if a.get("type") == "commentCard"]
-                if comment_actions:
-                    # Sort comment actions by date descending to find the newest
-                    comment_actions.sort(key=lambda x: x.get("date", ""), reverse=True)
-                    comment = comment_actions[0].get("data", {}).get("text", "")
+            actions = card_data.get("actions", [])
+            comment_actions = [a for a in actions if a.get("type") == "commentCard"]
+            if comment_actions:
+                # Sort comment actions by date descending to find the newest
+                comment_actions.sort(key=lambda x: x.get("date", ""), reverse=True)
+                latest_comment_action = comment_actions[0]
+                if not comment:
+                    comment = latest_comment_action.get("data", {}).get("text", "")
+
+    # Resolve the triggering Trello member if available
+    trigger_username = None
+    trigger_name = "Unknown"
+
+    # 1. Try extracting from raw webhook action
+    action_data = payload.get("action")
+    if isinstance(action_data, dict):
+        member_creator = action_data.get("memberCreator")
+        if isinstance(member_creator, dict):
+            trigger_username = member_creator.get("username")
+            trigger_name = member_creator.get("fullName") or trigger_username
+
+    # 2. Try the latest comment action from live fetched card data
+    if not trigger_username and latest_comment_action:
+        member_creator = latest_comment_action.get("memberCreator")
+        if isinstance(member_creator, dict):
+            trigger_username = member_creator.get("username")
+            trigger_name = member_creator.get("fullName") or trigger_username
+
+    # 3. Fallback/override check in case payload is simplified and has direct user fields
+    if not trigger_username:
+        trigger_username = payload.get("triggerUserUsername")
+    if trigger_name == "Unknown":
+        trigger_name = payload.get("triggerUserName", "Unknown")
+
+    trigger_user_info = ""
+    if trigger_username:
+        trigger_user_info = (
+            f"--- Webhook Triggering User ---\n"
+            f"This action/discussion was triggered by the following Trello member:\n"
+            f"- Name: {trigger_name}\n"
+            f"- Trello Username: @{trigger_username}\n"
+            f"When replying on the card, direct your response/tag to this user and other relevant stakeholders. "
+            f"Do NOT tag @fobtastic in your comment, as you are acting on behalf of @fobtastic.\n"
+            f"---------------------------------\n\n"
+        )
     
     # Resolve workspaces roles and git repo names
     workspaces_info = ""
@@ -401,7 +440,8 @@ async def trigger_agent(card_key, card_name, payload):
             "5. Remove the 'Ready for Spec' label on the Trello card, add the 'Ready for Implementation' label, and move the card to the 'Ready for Implementation' list.\n"
             "6. Relate specs to each other as appropriate, especially if there's both a FE and BE ticket as a result of the request.\n"
             "7. **Preserve QA/Discussion Context**: Since the QA, investigation, and design alignment conversations occurred asynchronously without engineering in the loop, you must summarize this context in your final specification. Detail what was asked during the grilling/QA phase, why it was asked, and what specific decision or option the PM/designer selected.\n"
-            f"8. Sign any card updates/comments with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            "8. Address your response/comments to the relevant Trello members/stakeholders (do NOT tag @fobtastic since you are acting on behalf of this account). "
+            f"Sign any card updates/comments with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -467,7 +507,7 @@ async def trigger_agent(card_key, card_name, payload):
             "7. **Adversarial Codex Review**: Before presenting options to the PM/members on Trello, you must get an adversarial second opinion/review on your proposed approaches from Codex:\n"
             "   - Call the `call_mcp_tool` tool with parameters: `ServerName: \"codex-mcp\"`, `ToolName: \"codex\"`, and `Arguments: {\"model\": \"gpt-5.5\", \"config\": {\"model_reasoning_effort\": \"high\"}, \"prompt\": \"Please review these three proposed UI/UX approaches for the Trello card and provide an adversarial second opinion, identifying hidden complexities, UX edge cases, and which approach/compromise makes the most sense. Propose any refinements. Approaches: [Insert your proposed approaches]\"}`.\n"
             "   - Refine and adjust your options/approaches based on Codex's feedback before presenting them.\n"
-            "8. **Post Comments & Tag**: Post your final refined response as a comment on the Trello card, tagging relevant members using '@' for specific replies. Keep sentences short and use bullet points for readability. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            "8. **Post Comments & Tag**: Post your final refined response as a comment on the Trello card. You MUST address the user who triggered/commented on the card (e.g. Natalie Luo / @natalieqq or other stakeholders). Do NOT tag @fobtastic (which is the account you are posting from). Keep sentences short and use bullet points for readability. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -485,7 +525,7 @@ async def trigger_agent(card_key, card_name, payload):
             "1. Respond constructively and collaboratively as appropriate.\n"
             "2. Keep language simple, non-technical, and scannable.\n"
             "3. **Non-Technical POV (UI/UX First)**: Frame your answers around user experience and interface presentation. Speak in user-facing terms rather than backend system behaviors, keeping the non-engineering audience (PMs, designers) in mind.\n"
-            f"4. Post your response as a comment on the Trello card. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            f"4. Post your response as a comment on the Trello card, addressing the stakeholders who initiated the discussion (do NOT tag @fobtastic since you are acting on behalf of this account). Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -549,6 +589,8 @@ async def trigger_agent(card_key, card_name, payload):
         f"Role & Core Instructions:\n{system_instruction}\n\n"
         f"Security Rules:\n{security_rules}\n\n"
     )
+    if trigger_user_info:
+        prompt += trigger_user_info
     if workspaces_info:
         prompt += (
             f"--- Active Workspaces ---\n"
