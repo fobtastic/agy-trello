@@ -7,6 +7,8 @@ import shutil
 import signal
 import subprocess
 import time
+import urllib.request
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Configure logging
@@ -59,6 +61,106 @@ def load_dotenv():
                 logging.error(f"[Trello Sidecar] Error parsing dotenv file {dotenv_path}: {e}")
 
 load_dotenv()
+
+def fetch_card_details_sync(card_id):
+    api_key = os.environ.get("TRELLO_API_KEY")
+    api_token = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
+    if not api_key or not api_token:
+        logging.warning("[Trello Sidecar] Missing Trello API key or token, cannot fetch full card details.")
+        return None
+    
+    # Query parameters to fetch card, list, actions, checklists, and members in one go
+    params = {
+        "key": api_key,
+        "token": api_token,
+        "actions": "commentCard",
+        "checklists": "all",
+        "list": "true",
+        "members": "true",
+        "fields": "name,desc,closed,idList,url,labels,due,dateLastActivity"
+    }
+    url = f"https://api.trello.com/1/cards/{card_id}?" + urllib.parse.urlencode(params)
+    
+    logging.info(f"[Trello Sidecar] Fetching card details from Trello for card ID: {card_id}...")
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.status == 200:
+                return json.loads(response.read().decode('utf-8'))
+            else:
+                logging.error(f"[Trello Sidecar] Failed to fetch card details. HTTP Status: {response.status}")
+    except Exception as e:
+        logging.error(f"[Trello Sidecar] Exception fetching card details: {e}")
+    return None
+
+def format_card_details(card_data):
+    if not card_data:
+        return "No card details could be fetched."
+    
+    name = card_data.get("name", "Unnamed Card")
+    desc = card_data.get("desc", "")
+    closed = "Closed" if card_data.get("closed") else "Active"
+    
+    list_info = card_data.get("list", {})
+    list_name = list_info.get("name", "Unknown List")
+    
+    labels = card_data.get("labels", [])
+    label_names = ", ".join([label.get("name") or label.get("color") for label in labels]) if labels else "None"
+    
+    due = card_data.get("due", "None")
+    last_activity = card_data.get("dateLastActivity", "Unknown")
+    url = card_data.get("url", "")
+    
+    # Checklists
+    checklists = card_data.get("checklists", [])
+    checklists_str = ""
+    if checklists:
+        for cl in checklists:
+            checklists_str += f"- Checklist: {cl.get('name')}\n"
+            for item in cl.get("checkItems", []):
+                state_char = "x" if item.get("state") == "complete" else " "
+                checklists_str += f"  - [{state_char}] {item.get('name')}\n"
+    else:
+        checklists_str = "None\n"
+        
+    # Comments (actions)
+    actions = card_data.get("actions", [])
+    comments_str = ""
+    # Sort comments chronologically (oldest first)
+    comments = []
+    for action in actions:
+        if action.get("type") == "commentCard":
+            member = action.get("memberCreator", {})
+            user = member.get("fullName") or member.get("username") or "Unknown User"
+            date = action.get("date", "")
+            text = action.get("data", {}).get("text", "")
+            comments.append((date, user, text))
+            
+    # Sort by date ascending
+    comments.sort(key=lambda x: x[0])
+    
+    if comments:
+        for date, user, text in comments:
+            comments_str += f"- **{user}** ({date}): {text}\n"
+    else:
+        comments_str = "None\n"
+        
+    formatted = (
+        f"### Card: {name}\n"
+        f"- **Status**: {closed}\n"
+        f"- **List**: {list_name}\n"
+        f"- **Labels**: {label_names}\n"
+        f"- **Due Date**: {due}\n"
+        f"- **Last Activity**: {last_activity}\n"
+        f"- **URL**: {url}\n\n"
+        f"### Description:\n"
+        f"{desc}\n\n"
+        f"### Checklists:\n"
+        f"{checklists_str}\n"
+        f"### Comments/Discussion History:\n"
+        f"{comments_str}"
+    )
+    return formatted
 
 # 5. Agent signature name configuration
 AGENT_SIGNATURE_NAME = os.environ.get("TRELLO_AGENT_SIGNATURE_NAME", "Agy")
@@ -154,9 +256,9 @@ async def classify_action(comment, card_name, card_desc, list_name):
         f"List Name: {list_name}\n"
         f"Triggering Comment: {comment}\n\n"
         f"Respond with exactly one word (no punctuation, no explanation, in uppercase):\n"
-        f"- READY_FOR_SPEC (if the comment indicates requirements are finalized, locked in, ready to build, or requests writing/creating a spec or GitHub issues)\n"
-        f"- INVESTIGATOR (if the comment asks for reviews, architectural suggestions, feedback, options, or is an early stage description that needs refinement/information)\n"
-        f"- GENERAL (if the comment is general discussion, questions, or conversational/generic)"
+        f"- READY_FOR_SPEC (if the list name is 'Ready for Spec' or 'Ready for Specification', or if the comment or description indicates requirements are finalized, locked in, ready to build/spec, or requests writing/creating a spec or GitHub issues)\n"
+        f"- INVESTIGATOR (if the list name is 'Ideas', 'Research', 'In Progress', or if the comment or card status asks for reviews, architectural suggestions, feedback, options, or is an early stage description that needs refinement/information)\n"
+        f"- GENERAL (if the trigger is conversational, generic testing, status updates, or general discussion/questions not related to planning or building a specific feature)"
     ]
     logging.info(f"[Trello Sidecar] Classifying trigger comment semantically...")
     try:
@@ -192,12 +294,66 @@ def extract_short_id(card_link):
         return match.group(1)
     return None
 
+def resolve_git_repo(directory):
+    try:
+        import re
+        res = subprocess.run(
+            ["git", "-C", directory, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=3
+        )
+        if res.returncode == 0:
+            url = res.stdout.strip()
+            match = re.search(r'github\.com[:/]([^/]+/[^.]+)', url)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    return None
+
 async def trigger_agent(card_key, card_name, payload):
     """Spawns an Antigravity agent by executing the agy CLI binary as a subprocess."""
     # Extract fields needed for classification
     comment = payload.get("comment", "")
     card_desc = payload.get("cardDescription", "")
     list_name = payload.get("listName", "")
+    
+    # Try to fetch live card details from Trello
+    card_id = payload.get("cardId")
+    card_details_str = ""
+    if card_id:
+        loop = asyncio.get_running_loop()
+        card_data = await loop.run_in_executor(None, fetch_card_details_sync, card_id)
+        if card_data:
+            card_details_str = format_card_details(card_data)
+            # Override local variables with latest live data from Trello
+            card_name = card_data.get("name", card_name)
+            card_desc = card_data.get("desc", card_desc)
+            if card_data.get("list"):
+                list_name = card_data["list"].get("name", list_name)
+            
+            # If no triggering comment is provided in payload, fall back to the latest comment on the card
+            if not comment:
+                actions = card_data.get("actions", [])
+                comment_actions = [a for a in actions if a.get("type") == "commentCard"]
+                if comment_actions:
+                    # Sort comment actions by date descending to find the newest
+                    comment_actions.sort(key=lambda x: x.get("date", ""), reverse=True)
+                    comment = comment_actions[0].get("data", {}).get("text", "")
+    
+    # Resolve workspaces roles and git repo names
+    workspaces_info = ""
+    if WORKSPACES:
+        workspaces_info += "### Loaded Workspaces:\n"
+        for ws in WORKSPACES:
+            role = "Unknown"
+            if "frontend" in ws.lower() or "fe" in ws.lower():
+                role = "Frontend (React/Next.js)"
+            elif "backend" in ws.lower() or "be" in ws.lower():
+                role = "Backend (Laravel/PHP)"
+            
+            git_repo = resolve_git_repo(ws)
+            repo_info = f" (Git Repo: `{git_repo}`)" if git_repo else ""
+            workspaces_info += f"- **{role}**: Path: `{ws}`{repo_info}\n"
     
     # Perform semantic classification
     phase = await classify_action(comment, card_name, card_desc, list_name)
@@ -212,16 +368,28 @@ async def trigger_agent(card_key, card_name, payload):
             "TRELLO_API_KEY, TRELLO_SECRET, and TRELLO_API_TOKEN).\n\n"
             "This card is Ready for Spec (finalized/locked in). Your goal is to write a detailed specification and create GitHub issues:\n"
             "1. Create a detailed spec based on the title, description, and discussions in the card. Ensure it is grounded in the existing codebase.\n"
-            "2. Once you write the draft plan, use the codex-mcp server to get an adversarial second opinion/review from Codex:\n"
-            "   - Call the codex-mcp tool `codex` with the prompt: 'Please review this proposed implementation plan and provide an adversarial second opinion. Highlight potential flaws, edge cases, or optimizations. Here is the draft plan: [Insert your draft plan] and the initial Trello request context: [Insert initial request/discussions].'\n"
+            "2. Once you write the draft plan, you must request an adversarial second opinion/review from Codex using the Codex MCP server:\n"
+            "   - Call the `call_mcp_tool` tool with parameters: `ServerName: \"codex-mcp\"`, `ToolName: \"codex\"`, and `Arguments: {\"model\": \"gpt-5.5\", \"config\": {\"model_reasoning_effort\": \"high\"}, \"prompt\": \"Please review this proposed implementation plan and provide an adversarial second opinion. Highlight potential flaws, edge cases, or optimizations. Here is the draft plan: [Insert your draft plan] and the initial Trello request context: [Insert initial request/discussions].\"}`.\n"
             "   - Refine and adjust your specification based on Codex's feedback/critique before proceeding.\n"
-            "3. Create matching issues in the appropriate Frontend (FE) and Backend (BE) Github repositories. Relate the issues to each other.\n"
+            "3. Create matching issues in the appropriate Frontend (FE) and Backend (BE) Github repositories. The `gh` CLI is installed and pre-authenticated for user @fobtastic. Use `gh issue create --repo <owner/repo> --title \"Title\" --body \"Body\"` instead of writing custom API scripts, and relate the issues to each other.\n"
             "4. Link the created GitHub issues back to the Trello card.\n"
             "5. If labels are available, remove the 'Ready for Spec' label on the Trello card and add the 'Ready for Implementation' label.\n"
             "6. Relate specs to each other as appropriate, especially if there's both a FE and BE ticket as a result of the request.\n"
-            f"7. Sign any card updates/comments with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            "7. **Preserve QA/Discussion Context**: Since the QA, investigation, and design alignment conversations occurred asynchronously without engineering in the loop, you must summarize this context in your final specification. Detail what was asked during the grilling/QA phase, why it was asked, and what specific decision or option the PM/designer selected.\n"
+            f"8. Sign any card updates/comments with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            "### Trello Helper Utility\n"
+            "To post comments, add/remove labels, or move card lists, call the pre-installed CLI utility via run_command instead of writing custom script files:\n"
+            f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
+            f"- Move to List: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py move <card_id> \"<list_name>\"`\n"
+            f"- Add Label: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py add-label <card_id> \"<label_name>\"`\n"
+            f"- Remove Label: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py remove-label <card_id> \"<label_name>\"`\n\n"
             "### Planning & Spec Rules\n\n"
             "Before writing any spec, plan or code, search the existing codebase first.\n\n"
+            "#### Ground on the Main Branch\n"
+            "Local working directories might be checked out to an in-progress, unstable, or outdated branch. Before analyzing code or writing a spec:\n"
+            "- Always run `git fetch origin` first to ensure the local repository is aware of all upstream changes.\n"
+            "- Check the git status and active branch. If it is not on the main/master branch, or if the branch is out of date, cross-reference and read the latest canonical files on the remote main branch (e.g. using `git show origin/main:path/to/file` or checking diffs via `git diff origin/main` to identify differences).\n"
+            "- Base all specifications, file additions, and edits on the latest `origin/main` state rather than potentially stale or broken local feature branch code.\n\n"
             "#### Search Before You Build\n"
             "When a task requires a component, service, helper, hook, or utility — search the repo for an existing one before creating anything new.\n"
             "- **Frontend (Next.js/TS):** Need a modal? Search for existing modal components before creating `NewModal.tsx`. Need to fetch jobs? Check for existing hooks like `useJobs` or `usePagination` before writing a new one. Need a form input? Look for shared components in `/components` before building custom ones.\n"
@@ -237,7 +405,8 @@ async def trigger_agent(card_key, card_name, payload):
             "7. **Error states** — plan for failure, what does the UI show? What does the API return?\n"
             "8. **Tests** — list what tests will be written. baselines are 80% coverage. Go beyond 80% for critical logic (payments, auth, scoring).\n"
             "9. **Acceptance criteria** — a numbered checklist the agent runs on itself.\n"
-            "10. **Edge cases and assumptions** — call them out explicitly.\n\n"
+            "10. **Edge cases and assumptions** — call them out explicitly.\n"
+            "11. **PM/QA Discussion Context** — summarize the questions asked during grilling, the reasons behind them, and the final design choices/approvals made by the PM.\n\n"
             "#### Acceptance Criteria Format\n"
             "Each criterion should be a concrete, checkable action.\n"
             "- [ ] Open the browser and navigate to `/jobs`.\n"
@@ -259,13 +428,27 @@ async def trigger_agent(card_key, card_name, payload):
             "You are reviewing and responding to Trello cards as the INVESTIGATOR on behalf of @fobtastic (Chris Tou). "
             "Use the Trello API to interact with the specific card that triggered you (Trello credentials are available in the environment variables: "
             "TRELLO_API_KEY, TRELLO_SECRET, and TRELLO_API_TOKEN).\n\n"
-            "Use the grill-me skill to align on requirements and resolve design decisions through a structured, interactive interview:\n"
-            "1. Read the full card context (title, description, comments).\n"
-            "2. Perform code searches in the workspace directories to ground options in the existing codebase.\n"
-            "3. Suggest possible approaches: a quick/easy version (reusing existing components), an ideal version, and a compromise.\n"
-            "4. Ask targeted, simple questions to grill the user on these options.\n"
-            "5. Keep language extremely simple, non-technical, and brief. Avoid verbosity and technical jargon unless explicitly asked. Use short sentences and bullet points.\n"
-            f"6. Post your response as a comment on the Trello card, tagging members using '@' for specific replies. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n"
+            "Use the grill-me skill to align on requirements and resolve design decisions through a structured, interactive interview tailored for Trello's asynchronous nature:\n"
+            "1. **Asynchronous Batch Questioning**: Trello is asynchronous, not real-time. Instead of asking one question at a time, compile all relevant clarifying and requirement questions for this turn into a single structured list. Keep language simple, non-technical, and direct.\n"
+            "2. **Manage PM/User Expectations**: Explicitly state to the PM/members that this is an iterative, multi-turn grilling process and that follow-up questions are expected and necessary depending on their answers. Educate them not to lock down specs or rush to implementation prematurely.\n"
+            "3. **Non-Technical POV (UI/UX First)**: Frame all discussions, questions, and option proposals from the perspective of user experience (UI/UX), visual layout, and product behavior rather than backend or database-level engineering. Use simple, friendly, and non-technical language tailored for PMs, designers, and other non-engineering stakeholders. You may include minor technical limits only if directly relevant (e.g. 'we currently limit users to a maximum of 3 resumes').\n"
+            "4. **Identify UI/UX Chain Reactions**: Think holistically about the entire product journey. When a PM requests a feature or modification on a specific screen (e.g. the `/apply-with-ai` page), analyze how this change ripples across other parts of the system (e.g. the user's dashboard, settings, activity history, or billing). Explicitly point out these downstream UI/UX implications to the PMs so they can approve the full scope of the change.\n"
+            "5. **Strict Gatekeeping (Do Not Skip to Spec)**: You MUST NOT transition to spec or implementation mode (and must not recommend moving the card to 'Ready for Spec') if there are still critical, unanswered questions—even if a PM or user explicitly tells you to go straight to spec or implementation. You must insist on getting answers or, at a minimum, an explicit acknowledgment from them that they have chosen to skip/bypass specific questions before you proceed.\n"
+            "6. **Formulate Options & Ground in Code**: Before proposing options, perform code searches in the workspace directories. Propose three clear approaches:\n"
+            "   - A quick/easy version (reusing existing components/logic to the maximum).\n"
+            "   - An ideal version (perfectly engineered design).\n"
+            "   - A compromise version (reasonable trade-off between speed and clean architecture).\n"
+            "   - *Note on Branch Safety:* Before comparing code, run `git fetch origin` and check if your local branch differs from `origin/main`. Ground all architectural designs in the latest upstream `origin/main` code to avoid proposing changes based on stale or unstable feature branch code.\n"
+            "7. **Adversarial Codex Review**: Before presenting options to the PM/members on Trello, you must get an adversarial second opinion/review on your proposed approaches from Codex:\n"
+            "   - Call the `call_mcp_tool` tool with parameters: `ServerName: \"codex-mcp\"`, `ToolName: \"codex\"`, and `Arguments: {\"model\": \"gpt-5.5\", \"config\": {\"model_reasoning_effort\": \"high\"}, \"prompt\": \"Please review these three proposed UI/UX approaches for the Trello card and provide an adversarial second opinion, identifying hidden complexities, UX edge cases, and which approach/compromise makes the most sense. Propose any refinements. Approaches: [Insert your proposed approaches]\"}`.\n"
+            "   - Refine and adjust your options/approaches based on Codex's feedback before presenting them.\n"
+            "8. **Post Comments & Tag**: Post your final refined response as a comment on the Trello card, tagging relevant members using '@' for specific replies. Keep sentences short and use bullet points for readability. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            "### Trello Helper Utility\n"
+            "To post comments, add/remove labels, or move card lists, call the pre-installed CLI utility via run_command instead of writing custom script files:\n"
+            f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
+            f"- Move to List: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py move <card_id> \"<list_name>\"`\n"
+            f"- Add Label: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py add-label <card_id> \"<label_name>\"`\n"
+            f"- Remove Label: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py remove-label <card_id> \"<label_name>\"`\n"
         )
     else:
         model_name = "Gemini 3.5 Flash (Medium)"
@@ -276,7 +459,14 @@ async def trigger_agent(card_key, card_name, payload):
             "This is a General Discussion trigger. The comment is conversational, seeking general feedback/ideas or asking general questions:\n"
             "1. Respond constructively and collaboratively as appropriate.\n"
             "2. Keep language simple, non-technical, and scannable.\n"
-            f"3. Post your response as a comment on the Trello card. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n"
+            "3. **Non-Technical POV (UI/UX First)**: Frame your answers around user experience and interface presentation. Speak in user-facing terms rather than backend system behaviors, keeping the non-engineering audience (PMs, designers) in mind.\n"
+            f"4. Post your response as a comment on the Trello card. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            "### Trello Helper Utility\n"
+            "To post comments, add/remove labels, or move card lists, call the pre-installed CLI utility via run_command instead of writing custom script files:\n"
+            f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
+            f"- Move to List: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py move <card_id> \"<list_name>\"`\n"
+            f"- Add Label: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py add-label <card_id> \"<label_name>\"`\n"
+            f"- Remove Label: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py remove-label <card_id> \"<label_name>\"`\n"
         )
 
     # Load existing session map
@@ -330,11 +520,25 @@ async def trigger_agent(card_key, card_name, payload):
     prompt = (
         f"Role & Core Instructions:\n{system_instruction}\n\n"
         f"Security Rules:\n{security_rules}\n\n"
-        f"--- Webhook Payload ---\n"
+    )
+    if workspaces_info:
+        prompt += (
+            f"--- Active Workspaces ---\n"
+            f"{workspaces_info}\n"
+            f"-------------------------\n\n"
+        )
+    if card_details_str:
+        prompt += (
+            f"--- Trello Card Live State ---\n"
+            f"{card_details_str}\n"
+            f"------------------------------\n\n"
+        )
+    prompt += (
+        f"--- Webhook Trigger Payload ---\n"
         f"{payload_str}\n"
-        f"------------------------\n\n"
-        f"1. Examine the Trello webhook payload above to understand the current Trello card context (cardName, cardDescription, listName, and comment/mention text).\n"
-        f"2. Execute your specialized mode behavior (PLANNER, INVESTIGATOR, or GENERAL discussion) based on the payload details.\n"
+        f"-------------------------------\n\n"
+        f"1. Examine the Trello webhook trigger payload and the live card state above to understand the current Trello card context (cardName, cardDescription, listName, checklists, comments, and recent activities).\n"
+        f"2. Execute your specialized mode behavior (PLANNER, INVESTIGATOR, or GENERAL discussion) based on the payload and card state.\n"
         f"3. Output your response or spec summary."
     )
     
