@@ -2,10 +2,13 @@ import asyncio
 import json
 import logging
 import os
+import queue
+import concurrent.futures
 import secrets
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -92,6 +95,22 @@ def fetch_card_details_sync(card_id):
     except Exception as e:
         logging.error(f"[Trello Sidecar] Exception fetching card details: {e}")
     return None
+
+def post_trello_comment(card_id, text):
+    api_key = os.environ.get("TRELLO_API_KEY")
+    api_token = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
+    if not api_key or not api_token or not card_id:
+        return
+    url = f"https://api.trello.com/1/cards/{card_id}/actions/comments?key={api_key}&token={api_token}"
+    data = {"text": text}
+    encoded_data = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(url, method="POST", data=encoded_data)
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            logging.info(f"[Trello Sidecar] Posted acknowledgement comment on Trello card {card_id}")
+    except Exception as e:
+        logging.error(f"[Trello Sidecar] Failed to post acknowledgement comment: {e}")
 
 def format_card_details(card_data):
     if not card_data:
@@ -245,6 +264,12 @@ def find_new_conversation_id(before_dirs):
 
 async def classify_action(comment, card_name, card_desc, list_name):
     """Performs a quick classification run using Gemini 3.5 Flash to determine the card's phase semantically."""
+    # Direct list name mapping
+    clean_list = str(list_name).strip().lower()
+    if clean_list in ["ready for spec", "ready for specification"]:
+        logging.info(f"[Trello Sidecar] Automatically classified phase as READY_FOR_SPEC due to list name: '{list_name}'")
+        return "READY_FOR_SPEC"
+
     cmd = [
         resolve_agy_bin(),
         "--dangerously-skip-permissions",
@@ -493,6 +518,7 @@ async def trigger_agent(card_key, card_name, payload):
     cmd = [
         resolve_agy_bin(),
         "--dangerously-skip-permissions",
+        "--print-timeout", "15m",
         "--model", model_name
     ]
     
@@ -512,9 +538,11 @@ async def trigger_agent(card_key, card_name, payload):
     
     security_rules = (
         "CRITICAL SECURITY REQUIREMENT:\n"
-        "Do NOT print, comment, or reveal any credentials, API keys, secrets, tokens, or passwords under any circumstances. "
+        "- Do NOT print, comment, or reveal any credentials, API keys, secrets, tokens, or passwords under any circumstances. "
         "This applies to Trello tokens/keys, database passwords (like db_reader), .env file contents, or any frontend/backend configuration keys. "
-        "If referring to configuration state, only indicate presence (e.g. 'verified TRELLO_API_KEY is configured') and NEVER print/disclose the actual values."
+        "If referring to configuration state, only indicate presence (e.g. 'verified TRELLO_API_KEY is configured') and NEVER print/disclose the actual values.\n"
+        "- STRICT READ-ONLY GUARDRAIL: You are strictly in an investigation and planning phase. You are STRICTLY FORBIDDEN from editing, creating, or deleting any files in the workspace repositories. "
+        "Do NOT use tools like write_to_file, replace_file_content, multi_replace_file_content, or run commands that modify code. Base your specifications and options purely on reading the code."
     )
     
     prompt = (
@@ -584,6 +612,34 @@ async def trigger_agent(card_key, card_name, payload):
         if process and process in active_processes:
             active_processes.remove(process)
 
+# Create a thread-safe queue for Trello agent triggers
+task_queue = queue.Queue()
+
+# ThreadPoolExecutor to run up to 3 agents concurrently
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+def run_agent_job(card_key, card_name_str, payload):
+    logging.info(f"[Trello Sidecar] Worker thread starting execution for card: '{card_name_str}'")
+    try:
+        asyncio.run(trigger_agent(card_key, card_name_str, payload))
+    except Exception as e:
+        logging.error(f"[Trello Sidecar] Exception during concurrent agent execution: {e}")
+
+def queue_worker():
+    logging.info("[Trello Sidecar] Background queue worker thread started successfully.")
+    while True:
+        try:
+            card_key, card_name_str, payload = task_queue.get()
+            logging.info(f"[Trello Sidecar] Worker pulled task for card: '{card_name_str}'. Submitting to executor...")
+            executor.submit(run_agent_job, card_key, card_name_str, payload)
+        except Exception as e:
+            logging.error(f"[Trello Sidecar] Worker exception submitting task: {e}")
+        finally:
+            task_queue.task_done()
+
+# Start background worker thread
+threading.Thread(target=queue_worker, daemon=True).start()
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         # Trello sends a HEAD request when verifying the webhook URL
@@ -637,12 +693,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
             card_key = card_id or card_name or "Unnamed Card"
             card_name_str = card_name or "Unnamed Card"
             
-            # Run the agent in a background thread to prevent blocking the HTTP server and Trello webhooks
-            import threading
-            threading.Thread(
-                target=lambda: asyncio.run(trigger_agent(card_key, card_name_str, payload)),
-                daemon=True
-            ).start()
+            # Enqueue the webhook payload for concurrent background execution
+            logging.info(f"[Trello Sidecar] Enqueueing agent trigger for card: '{card_name_str}'")
+            task_queue.put((card_key, card_name_str, payload))
+
+            if card_id:
+                # Post acknowledgement comment asynchronously to not block the webhook response
+                ack_text = f"Got it. Let me look into this...\n\n- Love {AGENT_SIGNATURE_NAME}"
+                threading.Thread(target=post_trello_comment, args=(card_id, ack_text), daemon=True).start()
             
             self.send_response(202)
             self.send_header('Content-type', 'application/json')
