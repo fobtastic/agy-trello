@@ -233,6 +233,16 @@ POST_ACK_COMMENTS = os.environ.get("TRELLO_POST_ACK_COMMENTS", "false").strip().
 }
 TRIGGER_COOLDOWN_SECONDS = get_env_int("TRELLO_TRIGGER_COOLDOWN_SECONDS", 300)
 MAX_RECENT_TRIGGERS = get_env_int("TRELLO_MAX_RECENT_TRIGGER_IDS", 500)
+ACK_COOLDOWN_SECONDS = get_env_int("TRELLO_ACK_COOLDOWN_SECONDS", 900)
+AGENT_COMMENT_MARKER = os.environ.get("TRELLO_AGENT_COMMENT_MARKER", "[agy-sidecar:comment]")
+AGENT_ACK_MARKER = os.environ.get("TRELLO_AGENT_ACK_MARKER", "[agy-sidecar:ack]")
+AGENT_STATUS_MARKER = os.environ.get("TRELLO_AGENT_STATUS_MARKER", "[agy-sidecar:status]")
+AGENT_COMMENT_USER_REGEX = os.environ.get(
+    "TRELLO_AGENT_COMMENT_USER_REGEX",
+    r"(?i)(^|[-_\s])(agent|agy|bot)([-_\s]|$)|^(agent|agy|bot)([-_\s]|$)",
+)
+LOW_NOVELTY_UNIQUE_TOKEN_RATIO = float(os.environ.get("TRELLO_LOW_NOVELTY_UNIQUE_TOKEN_RATIO", "0.35"))
+LOW_NOVELTY_OVERLAP_RATIO = float(os.environ.get("TRELLO_LOW_NOVELTY_OVERLAP_RATIO", "0.72"))
 
 DEFAULT_STAKEHOLDER_CONTEXT_FILE = os.path.expanduser("~/.gemini/antigravity-cli/trello_stakeholders.json")
 STAKEHOLDER_CONTEXT_FILE = os.environ.get("TRELLO_STAKEHOLDER_CONTEXT_FILE", DEFAULT_STAKEHOLDER_CONTEXT_FILE)
@@ -524,6 +534,24 @@ def extract_trigger_member(payload):
     name = payload.get("triggerUserName") or username or "Unknown"
     return (username or "").strip().lower(), name
 
+def extract_recent_comments_from_card_data(card_data, exclude_action_id=None, limit=12):
+    comments = []
+    for action in card_data.get("actions", []) or []:
+        if action.get("type") != "commentCard":
+            continue
+        if exclude_action_id and action.get("id") == exclude_action_id:
+            continue
+        text = action.get("data", {}).get("text")
+        if not text:
+            continue
+        comments.append({
+            "date": action.get("date", ""),
+            "text": text,
+            "memberCreator": action.get("memberCreator", {}),
+        })
+    comments.sort(key=lambda item: item.get("date", ""))
+    return comments[-limit:]
+
 def extract_action_id(payload):
     action_data = extract_action(payload)
     return action_data.get("id") or payload.get("actionId") or payload.get("idAction")
@@ -534,6 +562,134 @@ def extract_action_type(payload):
 
 def normalize_trigger_text(text):
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+NOVELTY_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by",
+    "can", "could", "do", "does", "for", "from", "got", "have", "i",
+    "if", "in", "is", "it", "its", "let", "me", "of", "on", "or",
+    "our", "should", "so", "that", "the", "their", "this", "to",
+    "we", "with", "you", "your",
+}
+
+LOW_SIGNAL_AGENT_PATTERNS = [
+    r"\b(agreed|agree|ok|okay|thanks|thank you|sounds good|looks good|lgtm|got it|checking|will check|let me know)\b",
+    r"^\s*(?:@\*\*?[A-Za-z0-9_]+\*\*?|@[A-Za-z0-9_]+|\s|[,!.])+?\s*$",
+]
+
+SUBSTANCE_SIGNAL_PATTERNS = [
+    r"\?",
+    r"https?://",
+    r"\b(issue|pr|pull request|github|trello|screenshot|mockup|figma|route|url|repro|steps?|error|bug|broken|decision|approve|approved|blocked|acceptance|criterion|criteria|requirement|scope|question|answer|confirm|choose|option|ship|deploy|staging)\b",
+    r"`[^`]+`",
+]
+
+def strip_agent_markers(text):
+    stripped = str(text or "")
+    for marker in [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]:
+        if marker:
+            stripped = stripped.replace(marker, " ")
+    stripped = re.sub(SUPPRESSED_COMMENT_REGEX, " ", stripped)
+    return stripped
+
+def normalized_novelty_text(text):
+    text = strip_agent_markers(text)
+    text = re.sub(r"@\*\*([A-Za-z0-9_]+)\*\*|@([A-Za-z0-9_]+)", " ", text)
+    text = re.sub(r"(?im)^\s*-\s*love\s+\w+\s*$", " ", text)
+    text = re.sub(r"https?://\S+", " URL ", text)
+    text = re.sub(r"[^a-zA-Z0-9_/?#.-]+", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+def novelty_tokens(text):
+    tokens = set()
+    for token in re.findall(r"[a-zA-Z0-9_#/.?-]+", normalized_novelty_text(text)):
+        token = token.strip(".,!?;:()[]{}")
+        if len(token) < 3 or token in NOVELTY_STOPWORDS:
+            continue
+        tokens.add(token)
+    return tokens
+
+def has_substance_signal(text):
+    normalized = normalized_novelty_text(text)
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in SUBSTANCE_SIGNAL_PATTERNS)
+
+def is_probable_agent_comment(comment, username=None, display_name=None):
+    text = str(comment or "")
+    if any(marker and marker in text for marker in [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]):
+        return True
+    for identity in [username, display_name]:
+        if not identity:
+            continue
+        try:
+            if re.search(AGENT_COMMENT_USER_REGEX, str(identity)):
+                return True
+        except re.error as e:
+            logging.warning("[Trello Sidecar] Invalid TRELLO_AGENT_COMMENT_USER_REGEX: %s", e)
+            return False
+    return False
+
+def extract_recent_comment_texts(payload):
+    recent = []
+    for entry in payload.get("recentComments", []) or []:
+        if isinstance(entry, dict):
+            text = entry.get("text") or entry.get("comment") or entry.get("body")
+        else:
+            text = entry
+        if text:
+            recent.append(str(text))
+    return recent[-12:]
+
+def is_low_signal_agent_comment(comment, recent_comments):
+    tokens = novelty_tokens(comment)
+    if not tokens:
+        return True
+
+    normalized = normalized_novelty_text(comment)
+    if not has_substance_signal(comment):
+        if any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in LOW_SIGNAL_AGENT_PATTERNS):
+            return True
+        if len(tokens) < 4:
+            return True
+
+    recent_token_sets = [novelty_tokens(text) for text in recent_comments if text]
+    recent_token_sets = [token_set for token_set in recent_token_sets if token_set]
+    if not recent_token_sets:
+        return False
+
+    recent_union = set().union(*recent_token_sets)
+    unique_ratio = len(tokens - recent_union) / max(len(tokens), 1)
+    max_overlap = max(
+        len(tokens & recent_tokens) / max(len(tokens | recent_tokens), 1)
+        for recent_tokens in recent_token_sets
+    )
+    return unique_ratio < LOW_NOVELTY_UNIQUE_TOKEN_RATIO or max_overlap >= LOW_NOVELTY_OVERLAP_RATIO
+
+def build_ack_comment():
+    return f"Got it, I am checking this now.\n\n{AGENT_ACK_MARKER}"
+
+def should_post_ack_comment(card_key, phase, state, now=None):
+    if phase not in {"INVESTIGATOR", "READY_FOR_SPEC"}:
+        return False
+    now = time.time() if now is None else now
+    last_ack_by_card = state.setdefault("last_ack_by_card", {})
+    last_ack = float(last_ack_by_card.get(str(card_key), 0) or 0)
+    return now - last_ack >= ACK_COOLDOWN_SECONDS
+
+def record_ack_comment(card_key):
+    with state_lock:
+        state = load_sidecar_state()
+        state.setdefault("last_ack_by_card", {})[str(card_key)] = time.time()
+        save_sidecar_state(state)
+
+def reserve_ack_comment(card_key, phase):
+    if not POST_ACK_COMMENTS:
+        return False
+    with state_lock:
+        state = load_sidecar_state()
+        if not should_post_ack_comment(card_key, phase, state):
+            return False
+        state.setdefault("last_ack_by_card", {})[str(card_key)] = time.time()
+        save_sidecar_state(state)
+        return True
 
 def trigger_fingerprint(card_key, payload, comment, list_name):
     parts = [
@@ -550,6 +706,8 @@ def is_agent_or_suppressed_comment(comment, username):
         return True
     if not comment:
         return False
+    if any(marker and marker in comment for marker in [AGENT_ACK_MARKER, AGENT_STATUS_MARKER]):
+        return True
     try:
         return bool(re.search(SUPPRESSED_COMMENT_REGEX, comment))
     except re.error as e:
@@ -566,6 +724,15 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
             username or display_name,
         )
         return False, "suppressed_trigger_member"
+    if is_probable_agent_comment(comment, username, display_name):
+        recent_comments = extract_recent_comment_texts(payload)
+        if is_low_signal_agent_comment(comment, recent_comments):
+            logging.info(
+                "[Trello Sidecar] Ignoring low-novelty agent comment on card '%s' (member=%s).",
+                card_name,
+                username or display_name,
+            )
+            return False, "low_novelty_agent_comment"
 
     action_id = extract_action_id(payload)
     fingerprint = trigger_fingerprint(card_key, payload, comment, list_name)
@@ -826,11 +993,24 @@ PROCESS_AUTOMATION_RULES = (
 )
 
 CODEX_REVIEW_PROMPT = (
-    "Ask Codex for a bounded review, not a rewrite. The prompt MUST include: "
+    "Ask Codex for a bounded review, not a rewrite. Tell Codex to apply Superpowers-style discipline if available: "
+    "brainstorming for unclear requirements, writing-plans for implementation specs, systematic-debugging for bug work, "
+    "test-driven-development for implementation guidance, and verification-before-completion for completion criteria. "
+    "The prompt MUST include: "
     "(1) one-paragraph product goal, (2) user-facing behavior, (3) repo/code paths inspected, "
     "(4) proposed FE/BE split, (5) acceptance criteria, (6) known open questions, and (7) duplicate/progress findings. "
     "Ask Codex to return only: top 5 risks, missing product decisions, likely duplicate/related work, test gaps, and concrete edits to the issue spec. "
     "Tell Codex not to restate the whole plan."
+)
+
+SUPERPOWERS_RULES = (
+    "### Superpowers Workflow Rules\n"
+    "- If the Superpowers skill/plugin is available, use it for process discipline.\n"
+    "- For unclear or creative product work, use brainstorming before planning or implementation-oriented recommendations.\n"
+    "- For bug investigation, use systematic-debugging and identify evidence/root cause before proposing fixes.\n"
+    "- For Ready for Spec work, use writing-plans style structure: clear goal, architecture, files/surfaces, implementation tasks, tests, and verification.\n"
+    "- For implementation handoff, include TDD-minded acceptance criteria and verification-before-completion checks.\n"
+    "- Do not expose Superpowers/tool ceremony in Trello comments; apply the workflow silently and summarize only useful outcomes.\n"
 )
 
 def format_user_profile(profile, prefix="- "):
@@ -1001,6 +1181,9 @@ async def trigger_agent(card_key, card_name, payload):
     # Perform semantic classification
     phase = await classify_action(comment, card_name, card_desc, list_name)
     logging.info(f"[Trello Sidecar] Determined phase: {phase} for card '{card_name}'")
+    if card_id and reserve_ack_comment(card_key, phase):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, post_trello_comment, card_id, build_ack_comment())
     github_work_context = collect_github_work_context(card_name, payload.get("cardLink")) if phase == "READY_FOR_SPEC" else ""
     stakeholder_context = build_stakeholder_context_block(trigger_username)
     
@@ -1074,6 +1257,7 @@ async def trigger_agent(card_key, card_name, payload):
             f"\n{AUDIENCE_RULES}\n"
             f"{GITHUB_ISSUE_QUALITY_RULES}\n"
             f"{PROCESS_AUTOMATION_RULES}\n"
+            f"{SUPERPOWERS_RULES}\n"
         )
     elif phase == "INVESTIGATOR":
         model_name = "Gemini 3.1 Pro (High)"
@@ -1097,6 +1281,7 @@ async def trigger_agent(card_key, card_name, payload):
             f"9. **Post Comments & Tag**: Post your final refined response as a comment on the Trello card. You MUST address the user who triggered/commented on the card and relevant stakeholders. Honor configured mention policies and never @-mention the acting/posting account or usernames marked `never_at_mention`. Keep sentences short and use bullet points for readability. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             f"{AUDIENCE_RULES}\n"
             f"{PROCESS_AUTOMATION_RULES}\n"
+            f"{SUPERPOWERS_RULES}\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -1117,6 +1302,7 @@ async def trigger_agent(card_key, card_name, payload):
             f"4. Post your response as a comment on the Trello card, addressing the triggering comment author and relevant stakeholders. Honor configured mention policies and never @-mention the acting/posting account or usernames marked `never_at_mention`. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             f"{AUDIENCE_RULES}\n"
             f"{PROCESS_AUTOMATION_RULES}\n"
+            f"{SUPERPOWERS_RULES}\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -1256,6 +1442,7 @@ task_queue = queue.Queue()
 
 # ThreadPoolExecutor to run up to 3 agents concurrently
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+queue_worker_started = False
 
 def run_agent_job(card_key, card_name_str, payload):
     logging.info(f"[Trello Sidecar] Worker thread starting execution for card: '{card_name_str}'")
@@ -1278,8 +1465,12 @@ def queue_worker():
         finally:
             task_queue.task_done()
 
-# Start background worker thread
-threading.Thread(target=queue_worker, daemon=True).start()
+def start_queue_worker():
+    global queue_worker_started
+    if queue_worker_started:
+        return
+    threading.Thread(target=queue_worker, daemon=True).start()
+    queue_worker_started = True
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -1349,6 +1540,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
             if comment:
                 payload["comment"] = comment
 
+            username, display_name = extract_trigger_member(payload)
+            if (
+                comment
+                and card_id
+                and not payload.get("recentComments")
+                and not is_agent_or_suppressed_comment(comment, username)
+                and is_probable_agent_comment(comment, username, display_name)
+            ):
+                card_data = fetch_card_details_sync(card_id)
+                if card_data:
+                    payload["recentComments"] = extract_recent_comments_from_card_data(
+                        card_data,
+                        exclude_action_id=extract_action_id(payload),
+                    )
+
             accepted, reason = should_accept_trigger(card_key, card_name_str, payload, comment, list_name)
             if not accepted:
                 self.send_response(200)
@@ -1360,11 +1566,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             # Enqueue the webhook payload for concurrent background execution
             logging.info(f"[Trello Sidecar] Enqueueing agent trigger for card: '{card_name_str}'")
             task_queue.put((card_key, card_name_str, payload))
-
-            if card_id and POST_ACK_COMMENTS:
-                # Optional; disabled by default because comments can wake other board automations/bots.
-                ack_text = f"Got it. Let me look into this...\n\n- Love {AGENT_SIGNATURE_NAME}"
-                threading.Thread(target=post_trello_comment, args=(card_id, ack_text), daemon=True).start()
             
             self.send_response(202)
             self.send_header('Content-type', 'application/json')
@@ -1431,6 +1632,7 @@ def run(port=8454):
     # Register SIGTERM/SIGINT handlers
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
+    start_queue_worker()
 
     # Bind only to 127.0.0.1 for secure local-only listening when testing/funneling
     server_address = ('127.0.0.1', port)

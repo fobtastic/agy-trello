@@ -75,7 +75,12 @@ The receiver includes deterministic guardrails to prevent bot-to-bot loops and d
 - `TRELLO_MENTION_REPLACEMENTS_JSON`: Optional JSON object mapping Trello usernames to plain-text replacements, for example `{"owner_username":"Owner Name"}`.
 - `TRELLO_STAKEHOLDER_CONTEXT_FILE`: Optional path to a local JSON roster. Defaults to `~/.gemini/antigravity-cli/trello_stakeholders.json` when present.
 - `TRELLO_STAKEHOLDER_CONTEXT_JSON`: Optional inline JSON roster for managed deployments. Prefer the file path for local development.
-- `TRELLO_POST_ACK_COMMENTS`: Whether to post an immediate "Got it" acknowledgement comment before the agent finishes. Defaults to `false` because ack comments can wake other board automations/bots.
+- `TRELLO_POST_ACK_COMMENTS`: Whether to post a safe "Got it" acknowledgement comment after a trigger is accepted and classified as long-running (`INVESTIGATOR` or `READY_FOR_SPEC`). Defaults to `false`; when enabled, acks are marker-tagged and cooldown-limited.
+- `TRELLO_ACK_COOLDOWN_SECONDS`: Minimum seconds between ack comments on the same card. Defaults to `900`.
+- `TRELLO_AGENT_COMMENT_MARKER`: Marker that identifies sidecar-authored substantive comments. Defaults to `[agy-sidecar:comment]`.
+- `TRELLO_AGENT_ACK_MARKER`: Marker that identifies sidecar acknowledgement comments. Defaults to `[agy-sidecar:ack]`.
+- `TRELLO_AGENT_STATUS_MARKER`: Marker that identifies sidecar status-only comments. Defaults to `[agy-sidecar:status]`.
+- `TRELLO_AGENT_COMMENT_USER_REGEX`: Regex used to detect likely agent/bot Trello users for novelty gating.
 - `TRELLO_TRIGGER_COOLDOWN_SECONDS`: Suppresses repeated identical triggers on the same card inside this window. Defaults to `300`.
 - `TRELLO_MAX_RECENT_TRIGGER_IDS`: Number of Trello action IDs remembered for replay suppression. Defaults to `500`.
 
@@ -83,6 +88,8 @@ Runtime trigger state is persisted locally under:
 `~/.gemini/antigravity-cli/trello_sidecar_state.json`
 
 The sidecar also keeps a single queued/running agent slot per Trello card. If several events arrive while a card is already being processed, only the first is accepted and the rest are ignored.
+
+Agent-to-agent comments are allowed when they add meaningful new content. Probable agent comments are suppressed only when they are low novelty, such as acknowledgement/status pings, mention-only chatter, repeated wording, or parroting recent comments without a new question, decision, bug detail, repro step, URL/screenshot/mockup, issue/PR link, requirement change, or explicit action request.
 
 Example stakeholder context:
 
@@ -187,6 +194,24 @@ Those results are injected into the agent prompt as a mandatory preflight sectio
 - Investigator mode does only light code grounding while product/design questions are unresolved; deep code dives and Codex review are reserved for planner mode after requirements settle.
 - If related PRs are already merged/deployed and new changes are requested, the sidecar treats them as follow-up work and links back to the original card for context.
 - Deployment-specific stakeholder names, roles, usernames, and mention policies belong in local stakeholder context, not committed source.
+
+---
+
+## Superpowers Skills
+
+Install the common Superpowers skills for agents that support `skills.sh`:
+
+```bash
+npx skills add obra/superpowers -g --skill using-superpowers brainstorming writing-plans systematic-debugging test-driven-development verification-before-completion --copy -y
+```
+
+The sidecar prompts tell Agy/Codex to use Superpowers-style discipline when available: brainstorm unclear product work, debug systematically, write structured implementation plans, include TDD-minded acceptance criteria, and verify before declaring completion. Trello comments should still stay product-facing and avoid tool/process ceremony.
+
+---
+
+## Dashboard Direction
+
+The sidecar should stay lightweight while behavior is still evolving. For a future dashboard, prefer emitting structured sidecar events first (trigger accepted/ignored, phase, card, related issues/PRs, run duration, outcome, duplicate decisions). A Laravel dashboard can later consume those events and local/session state without forcing the webhook runner itself to become Laravel immediately.
 
 ---
 

@@ -25,6 +25,9 @@ load_zshrc_env()
 API_KEY = os.environ.get("TRELLO_API_KEY")
 API_TOKEN = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
 AGENT_TRELLO_USERNAME = os.environ.get("TRELLO_AGENT_TRELLO_USERNAME", "").strip().lower()
+AGENT_COMMENT_MARKER = os.environ.get("TRELLO_AGENT_COMMENT_MARKER", "[agy-sidecar:comment]")
+AGENT_ACK_MARKER = os.environ.get("TRELLO_AGENT_ACK_MARKER", "[agy-sidecar:ack]")
+AGENT_STATUS_MARKER = os.environ.get("TRELLO_AGENT_STATUS_MARKER", "[agy-sidecar:status]")
 
 def normalize_username(value):
     return str(value or "").strip().lower().lstrip("@")
@@ -142,6 +145,14 @@ def sanitize_forbidden_mentions(text):
         )
     return sanitized
 
+def ensure_agent_comment_marker(text):
+    markers = [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]
+    if any(marker and marker in text for marker in markers):
+        return text
+    if not AGENT_COMMENT_MARKER:
+        return text
+    return text.rstrip() + f"\n\n{AGENT_COMMENT_MARKER}"
+
 def find_list_id(card_id, list_name):
     # Get card details to find the board ID
     url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}?key={API_KEY}&token={API_TOKEN}&fields=idBoard"
@@ -190,6 +201,7 @@ def find_label_id(card_id, label_name):
 
 def cmd_comment(card_id, text):
     text = sanitize_forbidden_mentions(text)
+    text = ensure_agent_comment_marker(text)
     url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}/actions/comments?key={API_KEY}&token={API_TOKEN}"
     res, err = make_request(url, method="POST", data={"text": text})
     if err:

@@ -20,11 +20,13 @@ Guidance for future coding agents working on this Antigravity Trello sidecar.
 ## Trello Trigger Rules
 
 - Prefer deterministic suppression before launching `agy`.
-- Do not post acknowledgement comments unless explicitly enabled. Ack comments can trigger other board automations.
+- Do not post acknowledgement comments unless explicitly enabled. Ack comments are only for long-running accepted `INVESTIGATOR` / `READY_FOR_SPEC` work, must include the configured ack marker, and are cooldown-limited per card.
 - The Trello account used by the API may also be a real human's account. Do not blindly suppress the acting account's username unless the deployment intentionally wants to ignore that person's manual comments too.
 - Suppress sidecar-authored comments by signature, e.g. `- Love Maeve`, and configurable known automation users through `TRELLO_SUPPRESSED_TRIGGER_USERNAMES`.
 - Never let agent-authored Trello comments @-mention the acting account or users marked `never_at_mention` in stakeholder context. `trello_helper.py` rewrites disallowed mentions to the configured plain-text replacement before posting.
 - When payloads provide only `cardLink`, resolve the short ID from `https://trello.com/c/<shortId>` and fetch live card details before deciding who authored the triggering comment.
+- Agent-to-agent conversation is allowed when it adds real substance. Suppress only low-novelty agent comments, acknowledgements, status pings, repeated wording, and mention-only chatter.
+- Probable agent comments should contain a new question, answer, decision, requirement, bug detail, repro step, URL/screenshot/mockup, issue/PR link, or explicit action request to trigger another run.
 
 ## Reply Targeting
 
@@ -70,12 +72,20 @@ Guidance for future coding agents working on this Antigravity Trello sidecar.
 - Skip Codex while requirements are still unsettled. Gather decisions first, then review the implementation plan.
 - Never paste raw secrets or environment values into Codex prompts.
 
+## Superpowers
+
+- Install the common Superpowers skills with `npx skills add obra/superpowers -g --skill using-superpowers brainstorming writing-plans systematic-debugging test-driven-development verification-before-completion --copy -y`.
+- Agy may also expose Superpowers through a local plugin under `~/.gemini/antigravity-cli/plugins/superpowers`.
+- Use Superpowers-style discipline silently: brainstorming for unclear product work, systematic-debugging for bug investigation, writing-plans for specs, TDD-minded implementation guidance, and verification-before-completion before declaring work done.
+- Trello comments should not mention Superpowers or tool usage unless a human explicitly asks about process.
+
 ## Verification Checklist
 
 Run these before committing sidecar changes:
 
 ```bash
 python3 -m py_compile .agents/plugins/trello-integration/sidecars/trello-webhook-receiver/server.py .agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py
+python3 -m unittest tests/test_sidecar_policies.py -v
 agy plugin validate .agents/plugins/trello-integration
 ```
 
