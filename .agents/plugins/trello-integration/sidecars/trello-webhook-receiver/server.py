@@ -12,6 +12,8 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+import hashlib
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Configure logging
@@ -65,6 +67,23 @@ def load_dotenv():
 
 load_dotenv()
 
+def redact_sensitive(value):
+    text = str(value)
+    text = re.sub(r'([?&](?:key|token)=)[^&\s]+', r'\1[REDACTED]', text, flags=re.IGNORECASE)
+    for secret_value in [
+        os.environ.get("TRELLO_API_KEY"),
+        os.environ.get("TRELLO_API_TOKEN"),
+        os.environ.get("TRELLO_TOKEN"),
+        os.environ.get("TRELLO_SECRET"),
+        os.environ.get("TRELLO_WEBHOOK_TOKEN"),
+    ]:
+        if secret_value:
+            text = text.replace(secret_value, "[REDACTED]")
+    return text
+
+def trello_path_id(value):
+    return urllib.parse.quote(str(value or "").strip(), safe="")
+
 def fetch_card_details_sync(card_id):
     api_key = os.environ.get("TRELLO_API_KEY")
     api_token = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
@@ -82,7 +101,7 @@ def fetch_card_details_sync(card_id):
         "members": "true",
         "fields": "name,desc,closed,idList,url,labels,due,dateLastActivity"
     }
-    url = f"https://api.trello.com/1/cards/{card_id}?" + urllib.parse.urlencode(params)
+    url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}?" + urllib.parse.urlencode(params)
     
     logging.info(f"[Trello Sidecar] Fetching card details from Trello for card ID: {card_id}...")
     try:
@@ -93,7 +112,7 @@ def fetch_card_details_sync(card_id):
             else:
                 logging.error(f"[Trello Sidecar] Failed to fetch card details. HTTP Status: {response.status}")
     except Exception as e:
-        logging.error(f"[Trello Sidecar] Exception fetching card details: {e}")
+        logging.error(f"[Trello Sidecar] Exception fetching card details: {redact_sensitive(e)}")
     return None
 
 def post_trello_comment(card_id, text):
@@ -101,7 +120,7 @@ def post_trello_comment(card_id, text):
     api_token = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
     if not api_key or not api_token or not card_id:
         return
-    url = f"https://api.trello.com/1/cards/{card_id}/actions/comments?key={api_key}&token={api_token}"
+    url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}/actions/comments?key={api_key}&token={api_token}"
     data = {"text": text}
     encoded_data = urllib.parse.urlencode(data).encode("utf-8")
     req = urllib.request.Request(url, method="POST", data=encoded_data)
@@ -110,7 +129,7 @@ def post_trello_comment(card_id, text):
         with urllib.request.urlopen(req, timeout=10) as r:
             logging.info(f"[Trello Sidecar] Posted acknowledgement comment on Trello card {card_id}")
     except Exception as e:
-        logging.error(f"[Trello Sidecar] Failed to post acknowledgement comment: {e}")
+        logging.error(f"[Trello Sidecar] Failed to post acknowledgement comment: {redact_sensitive(e)}")
 
 def format_card_details(card_data):
     if not card_data:
@@ -182,7 +201,38 @@ def format_card_details(card_data):
     return formatted
 
 # 5. Agent signature name configuration
+def get_env_int(name, default):
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning("[Trello Sidecar] Invalid integer for %s=%r. Using default %s.", name, raw, default)
+        return default
+
 AGENT_SIGNATURE_NAME = os.environ.get("TRELLO_AGENT_SIGNATURE_NAME", "Agy")
+AGENT_TRELLO_USERNAME = os.environ.get("TRELLO_AGENT_TRELLO_USERNAME", "fobtastic").strip().lower()
+SUPPRESSED_TRELLO_USERNAMES = {
+    username.strip().lower()
+    for username in os.environ.get(
+        "TRELLO_SUPPRESSED_TRIGGER_USERNAMES",
+        "trello,butler",
+    ).split(",")
+    if username.strip()
+}
+SUPPRESSED_COMMENT_REGEX = os.environ.get(
+    "TRELLO_SUPPRESSED_COMMENT_REGEX",
+    rf"(?im)^\s*-\s*Love\s+{re.escape(AGENT_SIGNATURE_NAME)}\s*$|^\s*-\s*Love\s+(INVESTIGATOR|PLANNER)\s*$",
+)
+POST_ACK_COMMENTS = os.environ.get("TRELLO_POST_ACK_COMMENTS", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+TRIGGER_COOLDOWN_SECONDS = get_env_int("TRELLO_TRIGGER_COOLDOWN_SECONDS", 300)
+MAX_RECENT_TRIGGERS = get_env_int("TRELLO_MAX_RECENT_TRIGGER_IDS", 500)
 
 def resolve_agy_bin():
     agy_bin = shutil.which("agy")
@@ -192,6 +242,19 @@ def resolve_agy_bin():
     if os.path.exists(local_agy):
         return local_agy
     return "/home/ubuntu/.local/bin/agy"
+
+def format_command_for_log(cmd):
+    safe_cmd = []
+    skip_next = False
+    for part in cmd:
+        if skip_next:
+            safe_cmd.append("[prompt omitted]")
+            skip_next = False
+            continue
+        safe_cmd.append(part)
+        if part == "--print":
+            skip_next = True
+    return " ".join(safe_cmd)
 
 # 1. Secure Token Resolution
 def get_auth_token():
@@ -228,6 +291,9 @@ def cleanup_processes():
 
 # 4. Session/Conversation Tracking (Resuming specific card conversations)
 SESSION_MAP_FILE = os.path.expanduser("~/.gemini/antigravity-cli/trello_sessions.json")
+SIDECAR_STATE_FILE = os.path.expanduser("~/.gemini/antigravity-cli/trello_sidecar_state.json")
+state_lock = threading.Lock()
+pending_cards = set()
 
 def load_session_mapping():
     if os.path.exists(SESSION_MAP_FILE):
@@ -246,6 +312,23 @@ def save_session_mapping(mapping):
             json.dump(mapping, f, indent=2)
     except Exception as e:
         logging.error(f"[Trello Sidecar] Error saving session mapping: {e}")
+
+def load_sidecar_state():
+    if os.path.exists(SIDECAR_STATE_FILE):
+        try:
+            with open(SIDECAR_STATE_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"[Trello Sidecar] Error loading sidecar state: {e}")
+    return {"recent_triggers": [], "card_activity": {}}
+
+def save_sidecar_state(state):
+    try:
+        os.makedirs(os.path.dirname(SIDECAR_STATE_FILE), exist_ok=True)
+        with open(SIDECAR_STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logging.error(f"[Trello Sidecar] Error saving sidecar state: {e}")
 
 def find_new_conversation_id(before_dirs):
     brain_dir = os.path.expanduser("~/.gemini/antigravity-cli/brain")
@@ -313,15 +396,25 @@ async def classify_action(comment, card_name, card_desc, list_name):
 def extract_short_id(card_link):
     if not card_link:
         return None
-    import re
     match = re.search(r'/c/([a-zA-Z0-9]+)', card_link)
     if match:
         return match.group(1)
     return None
 
+def extract_mentioned_usernames(text):
+    if not text:
+        return []
+    # Trello automation may markdown-bold mentions as @**username**.
+    mentions = re.findall(r'@\*\*([A-Za-z0-9_]+)\*\*|@([A-Za-z0-9_]+)', text)
+    usernames = []
+    for bold_match, plain_match in mentions:
+        username = (bold_match or plain_match or "").strip().lower()
+        if username and username not in usernames:
+            usernames.append(username)
+    return usernames
+
 def resolve_git_repo(directory):
     try:
-        import re
         res = subprocess.run(
             ["git", "-C", directory, "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=3
@@ -335,6 +428,293 @@ def resolve_git_repo(directory):
         pass
     return None
 
+def extract_action(payload):
+    action_data = payload.get("action")
+    return action_data if isinstance(action_data, dict) else {}
+
+def extract_trigger_member(payload):
+    action_data = extract_action(payload)
+    member_creator = action_data.get("memberCreator")
+    if isinstance(member_creator, dict):
+        username = member_creator.get("username")
+        name = member_creator.get("fullName") or username
+        return (username or "").strip().lower(), name or "Unknown"
+    username = payload.get("triggerUserUsername")
+    name = payload.get("triggerUserName") or username or "Unknown"
+    return (username or "").strip().lower(), name
+
+def extract_action_id(payload):
+    action_data = extract_action(payload)
+    return action_data.get("id") or payload.get("actionId") or payload.get("idAction")
+
+def extract_action_type(payload):
+    action_data = extract_action(payload)
+    return action_data.get("type") or payload.get("actionType") or "unknown"
+
+def normalize_trigger_text(text):
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+def trigger_fingerprint(card_key, payload, comment, list_name):
+    parts = [
+        str(card_key or ""),
+        extract_action_type(payload),
+        normalize_trigger_text(comment),
+        normalize_trigger_text(list_name),
+        normalize_trigger_text(payload.get("cardName")),
+    ]
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+def is_agent_or_suppressed_comment(comment, username):
+    if username and username in SUPPRESSED_TRELLO_USERNAMES:
+        return True
+    if not comment:
+        return False
+    try:
+        return bool(re.search(SUPPRESSED_COMMENT_REGEX, comment))
+    except re.error as e:
+        logging.warning("[Trello Sidecar] Invalid TRELLO_SUPPRESSED_COMMENT_REGEX: %s", e)
+        return f"- Love {AGENT_SIGNATURE_NAME}" in comment
+
+def should_accept_trigger(card_key, card_name, payload, comment, list_name):
+    now = time.time()
+    username, display_name = extract_trigger_member(payload)
+    if is_agent_or_suppressed_comment(comment, username):
+        logging.info(
+            "[Trello Sidecar] Ignoring trigger from suppressed member/signature on card '%s' (member=%s)",
+            card_name,
+            username or display_name,
+        )
+        return False, "suppressed_trigger_member"
+
+    action_id = extract_action_id(payload)
+    fingerprint = trigger_fingerprint(card_key, payload, comment, list_name)
+
+    with state_lock:
+        if card_key in pending_cards:
+            logging.info("[Trello Sidecar] Ignoring duplicate trigger while card '%s' already has a queued/running agent.", card_name)
+            return False, "card_already_running"
+
+        state = load_sidecar_state()
+        recent_triggers = state.setdefault("recent_triggers", [])
+        recent_ids = {entry.get("id") for entry in recent_triggers if entry.get("id")}
+        if action_id and action_id in recent_ids:
+            logging.info("[Trello Sidecar] Ignoring already-seen Trello action %s for card '%s'.", action_id, card_name)
+            return False, "duplicate_action"
+
+        card_activity = state.setdefault("card_activity", {})
+        last = card_activity.get(str(card_key), {})
+        last_seen = float(last.get("last_seen", 0) or 0)
+        if last.get("fingerprint") == fingerprint and now - last_seen < TRIGGER_COOLDOWN_SECONDS:
+            logging.info(
+                "[Trello Sidecar] Ignoring repeated trigger fingerprint for card '%s' within %ss cooldown.",
+                card_name,
+                TRIGGER_COOLDOWN_SECONDS,
+            )
+            return False, "trigger_cooldown"
+
+        if action_id:
+            recent_triggers.append({"id": action_id, "card": card_key, "seen_at": now})
+            state["recent_triggers"] = recent_triggers[-MAX_RECENT_TRIGGERS:]
+        card_activity[str(card_key)] = {
+            "fingerprint": fingerprint,
+            "last_seen": now,
+            "last_action_id": action_id,
+        }
+        pending_cards.add(card_key)
+        save_sidecar_state(state)
+
+    return True, "accepted"
+
+def release_pending_card(card_key):
+    with state_lock:
+        pending_cards.discard(card_key)
+
+def run_gh_json(args, cwd=None, timeout=12):
+    gh_bin = shutil.which("gh")
+    if not gh_bin:
+        return None, "gh CLI is not installed or not on PATH"
+    try:
+        res = subprocess.run(
+            [gh_bin, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+    except Exception as e:
+        return None, str(e)
+    if res.returncode != 0:
+        return None, res.stderr.strip() or res.stdout.strip()
+    try:
+        return json.loads(res.stdout or "[]"), None
+    except json.JSONDecodeError as e:
+        return None, f"Failed to parse gh JSON output: {e}"
+
+def build_duplicate_search_queries(card_name, card_link):
+    queries = []
+    if card_link:
+        queries.append(f'"{card_link}"')
+        short_id = extract_short_id(card_link)
+        if short_id:
+            queries.append(short_id)
+    title = normalize_trigger_text(card_name)
+    title = re.sub(r"[^a-z0-9 ]+", " ", title)
+    words = [w for w in title.split() if len(w) > 2][:8]
+    if words:
+        queries.append(" ".join(words))
+    return list(dict.fromkeys(queries))
+
+def collect_github_work_context(card_name, card_link):
+    if not WORKSPACES:
+        return ""
+
+    repos = []
+    for ws in WORKSPACES:
+        repo = resolve_git_repo(ws)
+        if repo and repo not in repos:
+            repos.append(repo)
+    if not repos:
+        return ""
+
+    lines = [
+        "--- GitHub Duplicate/Progress Preflight ---",
+        "The sidecar searched configured GitHub repositories before this planner run.",
+        "You MUST treat these as blocking context before creating any issue.",
+    ]
+    found_any = False
+    queries = build_duplicate_search_queries(card_name, card_link)
+
+    for repo in repos:
+        lines.append(f"\nRepository `{repo}`:")
+        repo_found = False
+        for query in queries:
+            issue_data, issue_err = run_gh_json([
+                "issue", "list",
+                "--repo", repo,
+                "--state", "all",
+                "--limit", "10",
+                "--search", query,
+                "--json", "number,title,state,url,updatedAt,labels",
+            ])
+            pr_data, pr_err = run_gh_json([
+                "pr", "list",
+                "--repo", repo,
+                "--state", "all",
+                "--limit", "10",
+                "--search", query,
+                "--json", "number,title,state,url,updatedAt,isDraft",
+            ])
+
+            if issue_data:
+                found_any = True
+                repo_found = True
+                lines.append(f"- Issues matching `{query}`:")
+                for item in issue_data:
+                    labels = ", ".join(label.get("name", "") for label in item.get("labels", []))
+                    labels_str = f"; labels: {labels}" if labels else ""
+                    lines.append(
+                        f"  - #{item.get('number')} [{item.get('state')}] {item.get('title')} "
+                        f"({item.get('url')}; updated {item.get('updatedAt')}{labels_str})"
+                    )
+            elif issue_err:
+                lines.append(f"- Issue search `{query}` failed: {issue_err}")
+
+            if pr_data:
+                found_any = True
+                repo_found = True
+                lines.append(f"- PRs matching `{query}`:")
+                for item in pr_data:
+                    draft = "draft, " if item.get("isDraft") else ""
+                    lines.append(
+                        f"  - #{item.get('number')} [{draft}{item.get('state')}] {item.get('title')} "
+                        f"({item.get('url')}; updated {item.get('updatedAt')})"
+                    )
+            elif pr_err:
+                lines.append(f"- PR search `{query}` failed: {pr_err}")
+
+        if not repo_found:
+            lines.append("- No matching issues or PRs found by the sidecar preflight.")
+
+    if not found_any:
+        lines.append(
+            "\nNo candidate duplicate/progress item was found automatically. You still MUST run your own targeted `gh issue list` "
+            "and `gh pr list` searches before creating new issues."
+        )
+    lines.append("-------------------------------------------\n")
+    return "\n".join(lines)
+
+def resolve_conversation_alias(session_map, card_key, card_name, card_link):
+    aliases = []
+    for value in [card_key, extract_short_id(card_link), card_name]:
+        if value and value not in aliases:
+            aliases.append(value)
+
+    for alias in aliases:
+        conversation_id = session_map.get(alias)
+        if conversation_id:
+            for other_alias in aliases:
+                if other_alias and session_map.get(other_alias) != conversation_id:
+                    session_map[other_alias] = conversation_id
+            return conversation_id, aliases
+    return None, aliases
+
+def collect_previous_conversation_context(conversation_id, max_chars=7000):
+    if not conversation_id:
+        return ""
+    brain_path = os.path.expanduser(f"~/.gemini/antigravity-cli/brain/{conversation_id}")
+    if not os.path.isdir(brain_path):
+        return ""
+
+    lines = [
+        "--- Previous Agy Conversation Artifacts ---",
+        f"Conversation ID: {conversation_id}",
+        "Use this as historical context for the same Trello card. If prior artifacts show GitHub issues/PRs already created or decisions already made, do not recreate them; update/link the existing work instead.",
+    ]
+    used_chars = 0
+    try:
+        filenames = sorted(os.listdir(brain_path))
+    except Exception as e:
+        return f"--- Previous Agy Conversation Artifacts ---\nCould not read brain artifacts for {conversation_id}: {e}\n-------------------------------------------\n"
+
+    for filename in filenames:
+        if filename.endswith(".metadata.json"):
+            path = os.path.join(brain_path, filename)
+            try:
+                with open(path, "r") as f:
+                    metadata = json.load(f)
+                summary = metadata.get("summary")
+                if summary:
+                    lines.append(f"- {filename}: {summary}")
+            except Exception:
+                continue
+
+    for filename in filenames:
+        if not filename.endswith(".md"):
+            continue
+        path = os.path.join(brain_path, filename)
+        try:
+            with open(path, "r") as f:
+                content = f.read().strip()
+        except Exception:
+            continue
+        if not content:
+            continue
+        remaining = max_chars - used_chars
+        if remaining <= 0:
+            break
+        snippet = content[: min(remaining, 1800)]
+        used_chars += len(snippet)
+        if len(content) > len(snippet):
+            snippet += "\n[truncated]"
+        lines.append(f"\n### {filename}\n{snippet}")
+
+    non_md_files = [filename for filename in filenames if not filename.endswith((".md", ".metadata.json"))]
+    if non_md_files:
+        lines.append("\nOther artifact files present but not inlined: " + ", ".join(non_md_files[:20]))
+
+    lines.append("-------------------------------------------\n")
+    return "\n".join(lines)
+
 async def trigger_agent(card_key, card_name, payload):
     """Spawns an Antigravity agent by executing the agy CLI binary as a subprocess."""
     # Extract fields needed for classification
@@ -344,6 +724,10 @@ async def trigger_agent(card_key, card_name, payload):
     
     # Try to fetch live card details from Trello
     card_id = payload.get("cardId")
+    if not card_id and payload.get("cardLink"):
+        card_id = extract_short_id(payload.get("cardLink"))
+        if card_id:
+            payload["cardId"] = card_id
     card_details_str = ""
     latest_comment_action = None
     if card_id:
@@ -392,15 +776,32 @@ async def trigger_agent(card_key, card_name, payload):
     if trigger_name == "Unknown":
         trigger_name = payload.get("triggerUserName", "Unknown")
 
+    mentioned_usernames = extract_mentioned_usernames(comment)
     trigger_user_info = ""
     if trigger_username:
+        mentioned_info = ""
+        if mentioned_usernames:
+            mentioned_info = (
+                f"- Usernames mentioned in the triggering comment text: "
+                f"{', '.join('@' + username for username in mentioned_usernames)}\n"
+            )
         trigger_user_info = (
             f"--- Webhook Triggering User ---\n"
             f"This action/discussion was triggered by the following Trello member:\n"
             f"- Name: {trigger_name}\n"
             f"- Trello Username: @{trigger_username}\n"
-            f"When replying on the card, direct your response/tag to this user and other relevant stakeholders. "
-            f"Do NOT tag @fobtastic in your comment, as you are acting on behalf of @fobtastic.\n"
+            f"{mentioned_info}"
+            f"When replying on the card, address/tag the triggering comment author first. "
+            f"Do not confuse usernames mentioned inside the comment with the author of the comment; mentioned usernames are only recipients/context. "
+            f"Never @-mention @fobtastic in agent-authored Trello comments, because self-mentions can trigger Trello automation loops. If replying to Chris/@fobtastic, address him as plain text `Chris` without the @ mention.\n"
+            f"---------------------------------\n\n"
+        )
+    elif mentioned_usernames:
+        trigger_user_info = (
+            f"--- Webhook Triggering User ---\n"
+            f"The webhook payload did not identify the comment author. Usernames mentioned in the triggering comment text are: "
+            f"{', '.join('@' + username for username in mentioned_usernames)}.\n"
+            f"Do not assume a mentioned username wrote the comment. If live Trello card state does not identify the author, keep the response untagged or address the team generally.\n"
             f"---------------------------------\n\n"
         )
     
@@ -422,6 +823,7 @@ async def trigger_agent(card_key, card_name, payload):
     # Perform semantic classification
     phase = await classify_action(comment, card_name, card_desc, list_name)
     logging.info(f"[Trello Sidecar] Determined phase: {phase} for card '{card_name}'")
+    github_work_context = collect_github_work_context(card_name, payload.get("cardLink")) if phase == "READY_FOR_SPEC" else ""
     
     # Choose the model and configure system instructions based on the phase
     if phase == "READY_FOR_SPEC":
@@ -430,17 +832,20 @@ async def trigger_agent(card_key, card_name, payload):
             "You are reviewing and responding to Trello cards as the PLANNER on behalf of @fobtastic (Chris Tou). "
             "Use the Trello API to interact with the specific card that triggered you (Trello credentials are available in the environment variables: "
             "TRELLO_API_KEY, TRELLO_SECRET, and TRELLO_API_TOKEN).\n\n"
-            "This card is Ready for Spec (finalized/locked in). Your goal is to write a detailed specification and create GitHub issues:\n"
-            "1. Create a detailed spec based on the title, description, and discussions in the card. Ensure it is grounded in the existing codebase.\n"
-            "2. Once you write the draft plan, you must request an adversarial second opinion/review from Codex using the Codex MCP server:\n"
+            "This card is Ready for Spec (finalized/locked in). Your goal is to write a detailed specification and create or update GitHub issues without duplicating active work:\n"
+            "1. First, perform a duplicate/progress check before writing specs or creating issues. Read the GitHub Duplicate/Progress Preflight context injected by the sidecar, then run your own targeted `gh issue list` and `gh pr list` searches in every relevant repository using the Trello card URL, short ID, title keywords, and any issue links already on the card.\n"
+            "2. If a matching issue or PR already exists, do not create a duplicate. Instead, update/comment on the existing issue or PR with any missing Trello context, link it back to the card, and explain the current progress/status on Trello. Only create a new issue when the existing work is materially different, closed as intentionally not planned, or missing a required FE/BE counterpart.\n"
+            "3. If duplicate status cannot be determined confidently, stop and post a Trello comment asking for human confirmation rather than creating a new issue.\n"
+            "4. Create a detailed spec based on the title, description, and discussions in the card. Ensure it is grounded in the existing codebase.\n"
+            "5. Once you write the draft plan, you must request an adversarial second opinion/review from Codex using the Codex MCP server:\n"
             "   - Call the `call_mcp_tool` tool with parameters: `ServerName: \"codex-mcp\"`, `ToolName: \"codex\"`, and `Arguments: {\"model\": \"gpt-5.5\", \"config\": {\"model_reasoning_effort\": \"high\"}, \"prompt\": \"Please review this proposed implementation plan and provide an adversarial second opinion. Highlight potential flaws, edge cases, or optimizations. Here is the draft plan: [Insert your draft plan] and the initial Trello request context: [Insert initial request/discussions].\"}`.\n"
             "   - Refine and adjust your specification based on Codex's feedback/critique before proceeding.\n"
-            "3. Create matching issues in the appropriate Frontend (FE) and Backend (BE) Github repositories. The `gh` CLI is installed and pre-authenticated for user @fobtastic. Use `gh issue create --repo <owner/repo> --title \"Title\" --body \"Body\"` instead of writing custom API scripts, and relate the issues to each other. **CRITICAL GUARDRAIL:** The body of every created GitHub issue MUST include a clear, direct link back to the originating Trello card (the Trello card link can be found in the webhook trigger payload as `cardLink` or in the card details as `url`, e.g., `https://trello.com/c/...`). This ensures context is not lost and allows status updates/syncing later.\n"
-            "4. Link the created GitHub issues back to the Trello card.\n"
-            "5. Remove the 'Ready for Spec' label on the Trello card, add the 'Ready for Implementation' label, and move the card to the 'Ready for Implementation' list.\n"
-            "6. Relate specs to each other as appropriate, especially if there's both a FE and BE ticket as a result of the request.\n"
-            "7. **Preserve QA/Discussion Context**: Since the QA, investigation, and design alignment conversations occurred asynchronously without engineering in the loop, you must summarize this context in your final specification. Detail what was asked during the grilling/QA phase, why it was asked, and what specific decision or option the PM/designer selected.\n"
-            "8. Address your response/comments to the relevant Trello members/stakeholders (do NOT tag @fobtastic since you are acting on behalf of this account). "
+            "6. Create matching issues in the appropriate Frontend (FE) and Backend (BE) Github repositories only after the duplicate/progress check passes. The `gh` CLI is installed and pre-authenticated for user @fobtastic. Use `gh issue create --repo <owner/repo> --title \"Title\" --body \"Body\"` instead of writing custom API scripts, and relate the issues to each other. **CRITICAL GUARDRAIL:** The body of every created GitHub issue MUST include a clear, direct link back to the originating Trello card (the Trello card link can be found in the webhook trigger payload as `cardLink` or in the card details as `url`, e.g., `https://trello.com/c/...`). This ensures context is not lost and allows status updates/syncing later.\n"
+            "7. Link the created or reused GitHub issues/PRs back to the Trello card.\n"
+            "8. Remove the 'Ready for Spec' label on the Trello card, add the 'Ready for Implementation' label, and move the card to the 'Ready for Implementation' list only after the GitHub work item set is confirmed non-duplicative.\n"
+            "9. Relate specs to each other as appropriate, especially if there's both a FE and BE ticket as a result of the request.\n"
+            "10. **Preserve QA/Discussion Context**: Since the QA, investigation, and design alignment conversations occurred asynchronously without engineering in the loop, you must summarize this context in your final specification. Detail what was asked during the grilling/QA phase, why it was asked, and what specific decision or option the PM/designer selected.\n"
+            "11. Address your response/comments to the triggering comment author and relevant Trello stakeholders. Never @-mention @fobtastic in agent-authored comments; if replying to Chris/@fobtastic, address him as plain text `Chris` without the @ mention. "
             f"Sign any card updates/comments with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
@@ -507,7 +912,7 @@ async def trigger_agent(card_key, card_name, payload):
             "7. **Adversarial Codex Review**: Before presenting options to the PM/members on Trello, you must get an adversarial second opinion/review on your proposed approaches from Codex:\n"
             "   - Call the `call_mcp_tool` tool with parameters: `ServerName: \"codex-mcp\"`, `ToolName: \"codex\"`, and `Arguments: {\"model\": \"gpt-5.5\", \"config\": {\"model_reasoning_effort\": \"high\"}, \"prompt\": \"Please review these three proposed UI/UX approaches for the Trello card and provide an adversarial second opinion, identifying hidden complexities, UX edge cases, and which approach/compromise makes the most sense. Propose any refinements. Approaches: [Insert your proposed approaches]\"}`.\n"
             "   - Refine and adjust your options/approaches based on Codex's feedback before presenting them.\n"
-            "8. **Post Comments & Tag**: Post your final refined response as a comment on the Trello card. You MUST address the user who triggered/commented on the card (e.g. Natalie Luo / @natalieqq or other stakeholders). Do NOT tag @fobtastic (which is the account you are posting from). Keep sentences short and use bullet points for readability. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            f"8. **Post Comments & Tag**: Post your final refined response as a comment on the Trello card. You MUST address the user who triggered/commented on the card (e.g. Natalie Luo / @natalieqq or other stakeholders). Never @-mention @fobtastic in agent-authored comments; if replying to Chris/@fobtastic, address him as plain text `Chris` without the @ mention. Keep sentences short and use bullet points for readability. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -525,7 +930,7 @@ async def trigger_agent(card_key, card_name, payload):
             "1. Respond constructively and collaboratively as appropriate.\n"
             "2. Keep language simple, non-technical, and scannable.\n"
             "3. **Non-Technical POV (UI/UX First)**: Frame your answers around user experience and interface presentation. Speak in user-facing terms rather than backend system behaviors, keeping the non-engineering audience (PMs, designers) in mind.\n"
-            f"4. Post your response as a comment on the Trello card, addressing the stakeholders who initiated the discussion (do NOT tag @fobtastic since you are acting on behalf of this account). Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            f"4. Post your response as a comment on the Trello card, addressing the triggering comment author and relevant stakeholders. Never @-mention @fobtastic in agent-authored comments; if replying to Chris/@fobtastic, address him as plain text `Chris` without the @ mention. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -536,19 +941,17 @@ async def trigger_agent(card_key, card_name, payload):
 
     # Load existing session map
     session_map = load_session_mapping()
-    conversation_id = session_map.get(card_key)
-    
-    # Fallback to short ID from cardLink if not found
     card_link = payload.get("cardLink")
-    if not conversation_id and card_link:
-        short_id = extract_short_id(card_link)
-        if short_id and short_id != card_key:
-            conversation_id = session_map.get(short_id)
-            if conversation_id:
-                logging.info(f"[Trello Sidecar] Found session via short ID fallback '{short_id}': {conversation_id}")
-                # Associate the new long ID/card_key with the existing conversation
-                session_map[card_key] = conversation_id
-                save_session_mapping(session_map)
+    conversation_id, conversation_aliases = resolve_conversation_alias(session_map, card_key, card_name, card_link)
+    if conversation_id:
+        logging.info(
+            "[Trello Sidecar] Found session %s for card '%s' via aliases: %s",
+            conversation_id,
+            card_name,
+            conversation_aliases,
+        )
+        save_session_mapping(session_map)
+    previous_conversation_context = collect_previous_conversation_context(conversation_id)
     
     # Keep track of brain directories before launch to capture new UUIDs
     brain_dir = os.path.expanduser("~/.gemini/antigravity-cli/brain")
@@ -597,6 +1000,10 @@ async def trigger_agent(card_key, card_name, payload):
             f"{workspaces_info}\n"
             f"-------------------------\n\n"
         )
+    if github_work_context:
+        prompt += github_work_context
+    if previous_conversation_context:
+        prompt += previous_conversation_context
     if card_details_str:
         prompt += (
             f"--- Trello Card Live State ---\n"
@@ -614,7 +1021,7 @@ async def trigger_agent(card_key, card_name, payload):
     
     cmd.extend(["--print", prompt])
     
-    logging.info(f"[Trello Sidecar] Running agy command: {' '.join(cmd)}")
+    logging.info(f"[Trello Sidecar] Running agy command: {format_command_for_log(cmd)}")
     
     target_cwd = WORKSPACES[0] if WORKSPACES else None
     process = None
@@ -634,7 +1041,9 @@ async def trigger_agent(card_key, card_name, payload):
                 new_id = find_new_conversation_id(before_dirs)
                 if new_id:
                     logging.info(f"[Trello Sidecar] Discovered new conversation ID {new_id} for card '{card_name}'")
-                    session_map[card_key] = new_id
+                    for alias in conversation_aliases:
+                        if alias:
+                            session_map[alias] = new_id
                     save_session_mapping(session_map)
                     break
         
@@ -666,6 +1075,8 @@ def run_agent_job(card_key, card_name_str, payload):
         asyncio.run(trigger_agent(card_key, card_name_str, payload))
     except Exception as e:
         logging.error(f"[Trello Sidecar] Exception during concurrent agent execution: {e}")
+    finally:
+        release_pending_card(card_key)
 
 def queue_worker():
     logging.info("[Trello Sidecar] Background queue worker thread started successfully.")
@@ -730,34 +1141,40 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 if action_data.get("type") == "commentCard":
                     comment = action_data.get("data", {}).get("text") or comment
 
+            if (not card_id or not str(card_id).strip()) and card_link:
+                card_id = extract_short_id(card_link) or card_id
+
             card_key = card_id or card_name or "Unnamed Card"
             card_name_str = card_name or "Unnamed Card"
 
-            # Prevent loop: ignore webhooks triggered by the agent's own comments/acknowledgements
-            if comment:
-                bot_signatures = [
-                    f"- Love {AGENT_SIGNATURE_NAME}",
-                    "- Love INVESTIGATOR",
-                    "- Love PLANNER"
-                ]
-                if any(sig in comment for sig in bot_signatures):
-                    logging.info(f"[Trello Sidecar] Ignoring webhook triggered by agent's own comment on card '{card_name_str}'")
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ignored", "reason":"agent_own_comment"}')
-                    return
-            
             # Ensure the resolved card ID is injected back into the payload so the agent can use it
             if card_id:
                 payload["cardId"] = card_id
+            if card_name:
+                payload["cardName"] = card_name
+            if card_desc:
+                payload["cardDescription"] = card_desc
+            if card_link:
+                payload["cardLink"] = card_link
+            if list_name:
+                payload["listName"] = list_name
+            if comment:
+                payload["comment"] = comment
+
+            accepted, reason = should_accept_trigger(card_key, card_name_str, payload, comment, list_name)
+            if not accepted:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ignored", "reason": reason}).encode("utf-8"))
+                return
             
             # Enqueue the webhook payload for concurrent background execution
             logging.info(f"[Trello Sidecar] Enqueueing agent trigger for card: '{card_name_str}'")
             task_queue.put((card_key, card_name_str, payload))
 
-            if card_id:
-                # Post acknowledgement comment asynchronously to not block the webhook response
+            if card_id and POST_ACK_COMMENTS:
+                # Optional; disabled by default because comments can wake other board automations/bots.
                 ack_text = f"Got it. Let me look into this...\n\n- Love {AGENT_SIGNATURE_NAME}"
                 threading.Thread(target=post_trello_comment, args=(card_id, ack_text), daemon=True).start()
             

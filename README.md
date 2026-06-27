@@ -66,6 +66,21 @@ These can be configured in your `.env` or inside the systemd service file:
   TRELLO_AGENT_WORKSPACES=/home/ubuntu/remote-hunter/remote-hunter-backend,/home/ubuntu/remote-hunter/remote-hunter-frontend
   ```
 
+### Runaway Conversation Controls
+The receiver includes deterministic guardrails to prevent bot-to-bot loops and duplicate work:
+- `TRELLO_AGENT_TRELLO_USERNAME`: Trello username for the account this sidecar posts as. Defaults to `fobtastic`.
+- `TRELLO_SUPPRESSED_TRIGGER_USERNAMES`: Comma-separated Trello usernames that should never trigger an agent run. Defaults to `trello,butler`. Add other automation/bot accounts here as they are identified. Do not add `fobtastic` unless you intentionally want to ignore Chris's manual comments too.
+- `TRELLO_SUPPRESSED_COMMENT_REGEX`: Regex for comment bodies that should never trigger an agent run. Defaults to the configured `- Love <signature>` and legacy planner/investigator signatures.
+- `TRELLO_NEVER_MENTION_USERNAMES`: Comma-separated Trello usernames that the helper must never @-mention in agent-authored comments. Defaults to `fobtastic`; the helper rewrites those mentions to plain text before posting.
+- `TRELLO_POST_ACK_COMMENTS`: Whether to post an immediate "Got it" acknowledgement comment before the agent finishes. Defaults to `false` because ack comments can wake other board automations/bots.
+- `TRELLO_TRIGGER_COOLDOWN_SECONDS`: Suppresses repeated identical triggers on the same card inside this window. Defaults to `300`.
+- `TRELLO_MAX_RECENT_TRIGGER_IDS`: Number of Trello action IDs remembered for replay suppression. Defaults to `500`.
+
+Runtime trigger state is persisted locally under:
+`~/.gemini/antigravity-cli/trello_sidecar_state.json`
+
+The sidecar also keeps a single queued/running agent slot per Trello card. If several events arrive while a card is already being processed, only the first is accepted and the rest are ignored.
+
 ---
 
 ## Installation & Deployment
@@ -115,6 +130,18 @@ Conversation history for each Trello card is persisted locally under:
 This file maps the Trello card ID to the Antigravity conversation UUID.
 - If a card has been previously interacted with, the sidecar automatically resumes the same session by passing the `--conversation <UUID>` flag to the `agy` CLI.
 - The webhook receiver parses both short card IDs (from URLs) and long card IDs (`cardidLong` / `cardIdLong`) and automatically resolves mappings to the active thread context.
+- The receiver checks all known aliases for a card (long ID, short Trello URL ID, and card title) before starting a new conversation. It also injects a compact summary of prior files under `~/.gemini/antigravity-cli/brain/<conversation-id>/` so the agent can see earlier specs, issue bodies, and decisions tied to that card.
+
+---
+
+## Duplicate GitHub Work Prevention
+
+Before a **PLANNER / Ready for Spec** run, the sidecar searches the configured workspace GitHub repositories for likely existing issues and PRs using:
+- The originating Trello card URL.
+- The Trello short card ID.
+- Normalized card title keywords.
+
+Those results are injected into the agent prompt as a mandatory preflight section. The planner is instructed to update or link existing GitHub issues/PRs instead of creating duplicates, and to stop for human confirmation when duplicate status is unclear.
 
 ---
 

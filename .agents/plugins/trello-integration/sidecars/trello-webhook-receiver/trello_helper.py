@@ -24,10 +24,29 @@ load_zshrc_env()
 
 API_KEY = os.environ.get("TRELLO_API_KEY")
 API_TOKEN = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
+NEVER_MENTION_USERNAMES = [
+    username.strip().lower()
+    for username in os.environ.get("TRELLO_NEVER_MENTION_USERNAMES", "fobtastic").split(",")
+    if username.strip()
+]
+MENTION_REPLACEMENTS = {
+    "fobtastic": os.environ.get("TRELLO_FOBTASTIC_DISPLAY_NAME", "Chris")
+}
 
 if not API_KEY or not API_TOKEN:
     print("Error: Missing TRELLO_API_KEY or TRELLO_API_TOKEN in environment / ~/.zshrc")
     sys.exit(1)
+
+def redact_sensitive(value):
+    text = str(value)
+    text = re.sub(r'([?&](?:key|token)=)[^&\s]+', r'\1[REDACTED]', text, flags=re.IGNORECASE)
+    for secret_value in [API_KEY, API_TOKEN, os.environ.get("TRELLO_SECRET"), os.environ.get("TRELLO_WEBHOOK_TOKEN")]:
+        if secret_value:
+            text = text.replace(secret_value, "[REDACTED]")
+    return text
+
+def trello_path_id(value):
+    return urllib.parse.quote(str(value or "").strip(), safe="")
 
 def make_request(url, method="GET", data=None):
     req = urllib.request.Request(url, method=method)
@@ -39,11 +58,29 @@ def make_request(url, method="GET", data=None):
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode("utf-8")), None
     except Exception as e:
-        return None, str(e)
+        return None, redact_sensitive(e)
+
+def sanitize_forbidden_mentions(text):
+    sanitized = text
+    for username in NEVER_MENTION_USERNAMES:
+        replacement = MENTION_REPLACEMENTS.get(username, username)
+        sanitized = re.sub(
+            rf'@\*\*{re.escape(username)}\*\*',
+            replacement,
+            sanitized,
+            flags=re.IGNORECASE,
+        )
+        sanitized = re.sub(
+            rf'@{re.escape(username)}\b',
+            replacement,
+            sanitized,
+            flags=re.IGNORECASE,
+        )
+    return sanitized
 
 def find_list_id(card_id, list_name):
     # Get card details to find the board ID
-    url = f"https://api.trello.com/1/cards/{card_id}?key={API_KEY}&token={API_TOKEN}&fields=idBoard"
+    url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}?key={API_KEY}&token={API_TOKEN}&fields=idBoard"
     card_data, err = make_request(url)
     if err or not card_data:
         return None, f"Failed to get card board ID: {err}"
@@ -66,7 +103,7 @@ def find_list_id(card_id, list_name):
 
 def find_label_id(card_id, label_name):
     # Get card details to find board ID
-    url = f"https://api.trello.com/1/cards/{card_id}?key={API_KEY}&token={API_TOKEN}&fields=idBoard"
+    url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}?key={API_KEY}&token={API_TOKEN}&fields=idBoard"
     card_data, err = make_request(url)
     if err or not card_data:
         return None, f"Failed to get card board ID: {err}"
@@ -88,7 +125,8 @@ def find_label_id(card_id, label_name):
     return None, f"Label '{label_name}' not found on board"
 
 def cmd_comment(card_id, text):
-    url = f"https://api.trello.com/1/cards/{card_id}/actions/comments?key={API_KEY}&token={API_TOKEN}"
+    text = sanitize_forbidden_mentions(text)
+    url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}/actions/comments?key={API_KEY}&token={API_TOKEN}"
     res, err = make_request(url, method="POST", data={"text": text})
     if err:
         print(f"Error posting comment: {err}")
@@ -100,7 +138,7 @@ def cmd_move(card_id, list_name):
     if err:
         print(f"Error: {err}")
         sys.exit(1)
-    url = f"https://api.trello.com/1/cards/{card_id}?key={API_KEY}&token={API_TOKEN}"
+    url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}?key={API_KEY}&token={API_TOKEN}"
     res, err = make_request(url, method="PUT", data={"idList": list_id})
     if err:
         print(f"Error moving card: {err}")
@@ -111,7 +149,7 @@ def cmd_add_label(card_id, label_name):
     label_id, err = find_label_id(card_id, label_name)
     if err:
         # Try creating the label directly if not found
-        url = f"https://api.trello.com/1/cards/{card_id}/labels?key={API_KEY}&token={API_TOKEN}"
+        url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}/labels?key={API_KEY}&token={API_TOKEN}"
         res, err2 = make_request(url, method="POST", data={"name": label_name, "color": "blue"})
         if err2:
             print(f"Error creating/adding label: {err2}")
@@ -119,7 +157,7 @@ def cmd_add_label(card_id, label_name):
         print(f"Successfully created and added label '{label_name}'.")
         return
         
-    url = f"https://api.trello.com/1/cards/{card_id}/idLabels?key={API_KEY}&token={API_TOKEN}"
+    url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}/idLabels?key={API_KEY}&token={API_TOKEN}"
     res, err = make_request(url, method="POST", data={"value": label_id})
     if err:
         print(f"Error adding label ID: {err}")
@@ -131,7 +169,7 @@ def cmd_remove_label(card_id, label_name):
     if err:
         print(f"Error: {err}")
         sys.exit(1)
-    url = f"https://api.trello.com/1/cards/{card_id}/idLabels/{label_id}?key={API_KEY}&token={API_TOKEN}"
+    url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}/idLabels/{trello_path_id(label_id)}?key={API_KEY}&token={API_TOKEN}"
     # Empty data for DELETE request
     res, err = make_request(url, method="DELETE", data={})
     if err:
