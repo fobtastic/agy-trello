@@ -212,7 +212,7 @@ def get_env_int(name, default):
         return default
 
 AGENT_SIGNATURE_NAME = os.environ.get("TRELLO_AGENT_SIGNATURE_NAME", "Agy")
-AGENT_TRELLO_USERNAME = os.environ.get("TRELLO_AGENT_TRELLO_USERNAME", "fobtastic").strip().lower()
+AGENT_TRELLO_USERNAME = os.environ.get("TRELLO_AGENT_TRELLO_USERNAME", "").strip().lower()
 SUPPRESSED_TRELLO_USERNAMES = {
     username.strip().lower()
     for username in os.environ.get(
@@ -233,6 +233,75 @@ POST_ACK_COMMENTS = os.environ.get("TRELLO_POST_ACK_COMMENTS", "false").strip().
 }
 TRIGGER_COOLDOWN_SECONDS = get_env_int("TRELLO_TRIGGER_COOLDOWN_SECONDS", 300)
 MAX_RECENT_TRIGGERS = get_env_int("TRELLO_MAX_RECENT_TRIGGER_IDS", 500)
+
+DEFAULT_STAKEHOLDER_CONTEXT_FILE = os.path.expanduser("~/.gemini/antigravity-cli/trello_stakeholders.json")
+STAKEHOLDER_CONTEXT_FILE = os.environ.get("TRELLO_STAKEHOLDER_CONTEXT_FILE", DEFAULT_STAKEHOLDER_CONTEXT_FILE)
+
+def normalize_roster_key(value):
+    return str(value or "").strip().lower().lstrip("@")
+
+def safe_roster_text(value, max_len=240):
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return text[:max_len]
+
+def load_stakeholder_context():
+    raw_context = os.environ.get("TRELLO_STAKEHOLDER_CONTEXT_JSON")
+    source = "TRELLO_STAKEHOLDER_CONTEXT_JSON"
+    if not raw_context and STAKEHOLDER_CONTEXT_FILE and os.path.exists(os.path.expanduser(STAKEHOLDER_CONTEXT_FILE)):
+        source = os.path.expanduser(STAKEHOLDER_CONTEXT_FILE)
+        try:
+            with open(source, "r") as f:
+                raw_context = f.read()
+        except Exception as e:
+            logging.warning("[Trello Sidecar] Failed to read stakeholder context file %s: %s", source, redact_sensitive(e))
+            raw_context = None
+    if not raw_context:
+        return {"source": None, "users": [], "users_by_username": {}, "rules": []}
+    try:
+        parsed = json.loads(raw_context)
+    except Exception as e:
+        logging.warning("[Trello Sidecar] Failed to parse stakeholder context from %s: %s", source, redact_sensitive(e))
+        return {"source": None, "users": [], "users_by_username": {}, "rules": []}
+
+    users = parsed.get("users", []) if isinstance(parsed, dict) else []
+    rules = parsed.get("rules", []) if isinstance(parsed, dict) else []
+    sanitized_users = []
+    users_by_username = {}
+    allowed_fields = [
+        "trello_username",
+        "display_name",
+        "role",
+        "authority",
+        "preferred_address",
+        "mention_policy",
+        "tone",
+        "notes",
+    ]
+    for user in users[:100]:
+        if not isinstance(user, dict):
+            continue
+        sanitized = {
+            field: safe_roster_text(user.get(field))
+            for field in allowed_fields
+            if safe_roster_text(user.get(field))
+        }
+        username = normalize_roster_key(sanitized.get("trello_username"))
+        if not username and not sanitized.get("display_name"):
+            continue
+        if username:
+            sanitized["trello_username"] = username
+            users_by_username[username] = sanitized
+        sanitized_users.append(sanitized)
+
+    sanitized_rules = [safe_roster_text(rule, 320) for rule in rules[:30] if safe_roster_text(rule, 320)]
+    return {
+        "source": source,
+        "users": sanitized_users,
+        "users_by_username": users_by_username,
+        "rules": sanitized_rules,
+    }
+
+STAKEHOLDER_CONTEXT = load_stakeholder_context()
 
 def resolve_agy_bin():
     agy_bin = shutil.which("agy")
@@ -353,6 +422,18 @@ async def classify_action(comment, card_name, card_desc, list_name):
         logging.info(f"[Trello Sidecar] Automatically classified phase as READY_FOR_SPEC due to list name: '{list_name}'")
         return "READY_FOR_SPEC"
 
+    clean_comment = normalize_trigger_text(comment)
+    simple_followup_patterns = [
+        r"\?$",
+        r"\b(why|what|where|when|who|how|isn'?t|aren'?t|don'?t|does|do|can|could|should)\b",
+        r"\b(looks good|lgtm|thanks|thank you|approved|ship it|go ahead|never responded|any update)\b",
+    ]
+    spec_request_pattern = r"\b(spec|github issue|create issue|ready for spec|ready to spec|write.*spec|locked in|requirements are final)\b"
+    if clean_comment and not re.search(spec_request_pattern, clean_comment):
+        if len(clean_comment) <= 240 and any(re.search(pattern, clean_comment) for pattern in simple_followup_patterns):
+            logging.info("[Trello Sidecar] Classified as GENERAL due to short follow-up/question comment.")
+            return "GENERAL"
+
     cmd = [
         resolve_agy_bin(),
         "--dangerously-skip-permissions",
@@ -366,7 +447,7 @@ async def classify_action(comment, card_name, card_desc, list_name):
         f"Respond with exactly one word (no punctuation, no explanation, in uppercase):\n"
         f"- READY_FOR_SPEC (if the list name is 'Ready for Spec' or 'Ready for Specification', or if the comment or description indicates requirements are finalized, locked in, ready to build/spec, or requests writing/creating a spec or GitHub issues)\n"
         f"- INVESTIGATOR (if the list name is 'Ideas', 'Research', 'In Progress', or if the comment or card status asks for reviews, architectural suggestions, feedback, options, or is an early stage description that needs refinement/information)\n"
-        f"- GENERAL (if the trigger is conversational, generic testing, status updates, or general discussion/questions not related to planning or building a specific feature)"
+        f"- GENERAL (if the trigger is conversational, generic testing, status updates, asks a simple follow-up question, asks for clarification on existing work, or is discussion not requesting a new spec/GitHub issue)"
     ]
     logging.info(f"[Trello Sidecar] Classifying trigger comment semantically...")
     try:
@@ -715,6 +796,103 @@ def collect_previous_conversation_context(conversation_id, max_chars=7000):
     lines.append("-------------------------------------------\n")
     return "\n".join(lines)
 
+AUDIENCE_RULES = (
+    "### Audience & Output Rules\n"
+    "- Trello comments are for PMs, designers, QA, and reporters. Keep them plain-language, product-facing, and short.\n"
+    "- Default Trello comment length: 3-6 bullets or under 120 words. Use more only when directly answering several explicit questions.\n"
+    "- Do not include file paths, class names, API routes, database fields, implementation details, tool names, or command narration in Trello comments unless a human explicitly asks for technical detail.\n"
+    "- Never explain which tools you considered or say you are about to run a command. Just perform the action and summarize the result.\n"
+    "- For design-facing replies, discuss user flow, screen behavior, copy, layout, states, and decisions needed. Avoid backend or repo terminology.\n"
+    "- Put technical details in GitHub issue bodies, not Trello comments. Trello should say what changed, what decision is needed, or where the GitHub issue/PR is.\n"
+    "- If a comment asks a simple question about existing work, answer the question first. Do not re-open planning, create duplicate issues, or move cards unless explicitly requested.\n"
+)
+
+GITHUB_ISSUE_QUALITY_RULES = (
+    "### GitHub Issue Quality Rules\n"
+    "- Write issues for coding agents, not PMs. They must be specific enough to implement without re-reading the whole Trello thread.\n"
+    "- Start every issue with a short Product Summary in plain language, then a Technical Implementation section.\n"
+    "- Include source links: Trello card, related Trello cards, existing issues/PRs, screenshots/mockups, and relevant code paths found during grounding.\n"
+    "- Clearly separate FE, BE, QA, analytics, and deployment/staging concerns.\n"
+    "- Include exact acceptance criteria that an implementation agent can verify in browser/API tests.\n"
+    "- If the work touches a post-merge follow-up, prefer creating/linking a new Trello card or GitHub issue instead of expanding an already-merged issue, unless the reporter is clearly adding context to active unfinished work.\n"
+)
+
+PROCESS_AUTOMATION_RULES = (
+    "### Process Automation Rules\n"
+    "- The pipeline goal is: Trello request discussion -> high-quality GitHub issue -> coding agent implementation -> PR -> staging feedback.\n"
+    "- Preserve context, but do not let old cards become endless implementation threads.\n"
+    "- If related PRs are already merged/deployed and the reporter asks for additional changes, treat it as follow-up work. Recommend or create/link a new Trello card/GitHub issue while referencing the original card for context.\n"
+    "- If work is still active in an open issue/PR, update/link the active work instead of creating new duplicates.\n"
+)
+
+CODEX_REVIEW_PROMPT = (
+    "Ask Codex for a bounded review, not a rewrite. The prompt MUST include: "
+    "(1) one-paragraph product goal, (2) user-facing behavior, (3) repo/code paths inspected, "
+    "(4) proposed FE/BE split, (5) acceptance criteria, (6) known open questions, and (7) duplicate/progress findings. "
+    "Ask Codex to return only: top 5 risks, missing product decisions, likely duplicate/related work, test gaps, and concrete edits to the issue spec. "
+    "Tell Codex not to restate the whole plan."
+)
+
+def format_user_profile(profile, prefix="- "):
+    labels = [
+        ("display_name", "Display name"),
+        ("trello_username", "Trello username"),
+        ("role", "Role"),
+        ("authority", "Authority"),
+        ("preferred_address", "Preferred address"),
+        ("mention_policy", "Mention policy"),
+        ("tone", "Tone"),
+        ("notes", "Notes"),
+    ]
+    lines = []
+    for key, label in labels:
+        value = profile.get(key)
+        if not value:
+            continue
+        if key == "trello_username":
+            value = f"@{value}"
+        lines.append(f"{prefix}{label}: {value}")
+    return "\n".join(lines)
+
+def build_stakeholder_context_block(trigger_username):
+    if not STAKEHOLDER_CONTEXT.get("users") and not STAKEHOLDER_CONTEXT.get("rules"):
+        return ""
+
+    trigger_key = normalize_roster_key(trigger_username)
+    trigger_profile = STAKEHOLDER_CONTEXT.get("users_by_username", {}).get(trigger_key)
+    lines = [
+        "--- Stakeholder Context ---",
+        "This deployment provided local stakeholder context. Use it to adapt tone, authority, escalation, and mention behavior. Do not invent roles for people who are not listed.",
+        "Mention policy meanings: `never_at_mention` means address by preferred name without @; `direct_reply_only` means @mention only when directly replying to that person; `ok` means normal Trello mention behavior is allowed.",
+    ]
+
+    if trigger_profile:
+        lines.append("\nTriggering user profile:")
+        lines.append(format_user_profile(trigger_profile))
+    elif trigger_username:
+        lines.append(f"\nNo roster profile found for triggering username @{normalize_roster_key(trigger_username)}. Use default PM/designer-friendly tone unless the card context says otherwise.")
+
+    roster_lines = []
+    for profile in STAKEHOLDER_CONTEXT.get("users", [])[:40]:
+        name = profile.get("display_name") or profile.get("trello_username") or "Unknown"
+        username = f" (@{profile['trello_username']})" if profile.get("trello_username") else ""
+        role = f" - {profile['role']}" if profile.get("role") else ""
+        authority = f"; authority: {profile['authority']}" if profile.get("authority") else ""
+        mention = f"; mention: {profile['mention_policy']}" if profile.get("mention_policy") else ""
+        tone = f"; tone: {profile['tone']}" if profile.get("tone") else ""
+        roster_lines.append(f"- {name}{username}{role}{authority}{mention}{tone}")
+    if roster_lines:
+        lines.append("\nConfigured roster:")
+        lines.extend(roster_lines)
+
+    rules = STAKEHOLDER_CONTEXT.get("rules", [])
+    if rules:
+        lines.append("\nDeployment-specific rules:")
+        lines.extend(f"- {rule}" for rule in rules)
+
+    lines.append("---------------------------\n")
+    return "\n".join(lines)
+
 async def trigger_agent(card_key, card_name, payload):
     """Spawns an Antigravity agent by executing the agy CLI binary as a subprocess."""
     # Extract fields needed for classification
@@ -793,7 +971,7 @@ async def trigger_agent(card_key, card_name, payload):
             f"{mentioned_info}"
             f"When replying on the card, address/tag the triggering comment author first. "
             f"Do not confuse usernames mentioned inside the comment with the author of the comment; mentioned usernames are only recipients/context. "
-            f"Never @-mention @fobtastic in agent-authored Trello comments, because self-mentions can trigger Trello automation loops. If replying to Chris/@fobtastic, address him as plain text `Chris` without the @ mention.\n"
+            f"Honor the Stakeholder Context and configured mention policies. Never @-mention the acting/posting account or any username whose mention policy is `never_at_mention`, because self-mentions and configured users can trigger automation loops.\n"
             f"---------------------------------\n\n"
         )
     elif mentioned_usernames:
@@ -824,12 +1002,13 @@ async def trigger_agent(card_key, card_name, payload):
     phase = await classify_action(comment, card_name, card_desc, list_name)
     logging.info(f"[Trello Sidecar] Determined phase: {phase} for card '{card_name}'")
     github_work_context = collect_github_work_context(card_name, payload.get("cardLink")) if phase == "READY_FOR_SPEC" else ""
+    stakeholder_context = build_stakeholder_context_block(trigger_username)
     
     # Choose the model and configure system instructions based on the phase
     if phase == "READY_FOR_SPEC":
         model_name = "Gemini 3.1 Pro (High)"
         system_instruction = (
-            "You are reviewing and responding to Trello cards as the PLANNER on behalf of @fobtastic (Chris Tou). "
+            "You are reviewing and responding to Trello cards as the PLANNER for the configured automation pipeline. "
             "Use the Trello API to interact with the specific card that triggered you (Trello credentials are available in the environment variables: "
             "TRELLO_API_KEY, TRELLO_SECRET, and TRELLO_API_TOKEN).\n\n"
             "This card is Ready for Spec (finalized/locked in). Your goal is to write a detailed specification and create or update GitHub issues without duplicating active work:\n"
@@ -838,14 +1017,15 @@ async def trigger_agent(card_key, card_name, payload):
             "3. If duplicate status cannot be determined confidently, stop and post a Trello comment asking for human confirmation rather than creating a new issue.\n"
             "4. Create a detailed spec based on the title, description, and discussions in the card. Ensure it is grounded in the existing codebase.\n"
             "5. Once you write the draft plan, you must request an adversarial second opinion/review from Codex using the Codex MCP server:\n"
-            "   - Call the `call_mcp_tool` tool with parameters: `ServerName: \"codex-mcp\"`, `ToolName: \"codex\"`, and `Arguments: {\"model\": \"gpt-5.5\", \"config\": {\"model_reasoning_effort\": \"high\"}, \"prompt\": \"Please review this proposed implementation plan and provide an adversarial second opinion. Highlight potential flaws, edge cases, or optimizations. Here is the draft plan: [Insert your draft plan] and the initial Trello request context: [Insert initial request/discussions].\"}`.\n"
+            f"   - {CODEX_REVIEW_PROMPT}\n"
+            "   - Call the `call_mcp_tool` tool with parameters exactly shaped as: `ServerName: \"codex-mcp\"`, `ToolName: \"codex\"`, and `Arguments: {\"model\": \"gpt-5.5\", \"config\": {\"model_reasoning_effort\": \"high\"}, \"prompt\": \"[bounded review prompt]\"}`. The `Arguments` object must contain a top-level `prompt` field.\n"
             "   - Refine and adjust your specification based on Codex's feedback/critique before proceeding.\n"
-            "6. Create matching issues in the appropriate Frontend (FE) and Backend (BE) Github repositories only after the duplicate/progress check passes. The `gh` CLI is installed and pre-authenticated for user @fobtastic. Use `gh issue create --repo <owner/repo> --title \"Title\" --body \"Body\"` instead of writing custom API scripts, and relate the issues to each other. **CRITICAL GUARDRAIL:** The body of every created GitHub issue MUST include a clear, direct link back to the originating Trello card (the Trello card link can be found in the webhook trigger payload as `cardLink` or in the card details as `url`, e.g., `https://trello.com/c/...`). This ensures context is not lost and allows status updates/syncing later.\n"
+            "6. Create matching issues in the appropriate Frontend (FE) and Backend (BE) Github repositories only after the duplicate/progress check passes. The `gh` CLI is installed and pre-authenticated for this runtime environment. Use `gh issue create --repo <owner/repo> --title \"Title\" --body \"Body\"` instead of writing custom API scripts, and relate the issues to each other. **CRITICAL GUARDRAIL:** The body of every created GitHub issue MUST include a clear, direct link back to the originating Trello card (the Trello card link can be found in the webhook trigger payload as `cardLink` or in the card details as `url`, e.g., `https://trello.com/c/...`). This ensures context is not lost and allows status updates/syncing later.\n"
             "7. Link the created or reused GitHub issues/PRs back to the Trello card.\n"
             "8. Remove the 'Ready for Spec' label on the Trello card, add the 'Ready for Implementation' label, and move the card to the 'Ready for Implementation' list only after the GitHub work item set is confirmed non-duplicative.\n"
             "9. Relate specs to each other as appropriate, especially if there's both a FE and BE ticket as a result of the request.\n"
             "10. **Preserve QA/Discussion Context**: Since the QA, investigation, and design alignment conversations occurred asynchronously without engineering in the loop, you must summarize this context in your final specification. Detail what was asked during the grilling/QA phase, why it was asked, and what specific decision or option the PM/designer selected.\n"
-            "11. Address your response/comments to the triggering comment author and relevant Trello stakeholders. Never @-mention @fobtastic in agent-authored comments; if replying to Chris/@fobtastic, address him as plain text `Chris` without the @ mention. "
+            "11. Address your response/comments to the triggering comment author and relevant Trello stakeholders. Honor configured mention policies and never @-mention the acting/posting account or usernames marked `never_at_mention`. "
             f"Sign any card updates/comments with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
@@ -891,28 +1071,32 @@ async def trigger_agent(card_key, card_name, payload):
             "- Extend over duplicate.\n"
             "- If you're unsure whether something exists, search.\n"
             "- Don't mark a task complete until every acceptance criterion is checked.\n"
+            f"\n{AUDIENCE_RULES}\n"
+            f"{GITHUB_ISSUE_QUALITY_RULES}\n"
+            f"{PROCESS_AUTOMATION_RULES}\n"
         )
     elif phase == "INVESTIGATOR":
         model_name = "Gemini 3.1 Pro (High)"
         system_instruction = (
-            "You are reviewing and responding to Trello cards as the INVESTIGATOR on behalf of @fobtastic (Chris Tou). "
+            "You are reviewing and responding to Trello cards as the INVESTIGATOR for the configured automation pipeline. "
             "Use the Trello API to interact with the specific card that triggered you (Trello credentials are available in the environment variables: "
             "TRELLO_API_KEY, TRELLO_SECRET, and TRELLO_API_TOKEN).\n\n"
             "Use the grill-me skill to align on requirements and resolve design decisions through a structured, interactive interview tailored for Trello's asynchronous nature:\n"
-            "1. **Asynchronous Batch Questioning**: Trello is asynchronous, not real-time. Instead of asking one question at a time, compile all relevant clarifying and requirement questions for this turn into a single structured list. Keep language simple, non-technical, and direct.\n"
-            "2. **Manage PM/User Expectations**: Explicitly state to the PM/members that this is an iterative, multi-turn grilling process and that follow-up questions are expected and necessary depending on their answers. Educate them not to lock down specs or rush to implementation prematurely.\n"
+            "1. **Asynchronous Batch Questioning**: Trello is asynchronous, not real-time. Ask only the questions needed to unblock product/design decisions in this turn. Usually ask 2-5 questions, not a long interrogation. Keep language simple, non-technical, and direct.\n"
+            "2. **Manage PM/User Expectations**: Briefly state that follow-up questions may happen, but do not lecture the PM/designer about process.\n"
             "3. **Non-Technical POV (UI/UX First)**: Frame all discussions, questions, and option proposals from the perspective of user experience (UI/UX), visual layout, and product behavior rather than backend or database-level engineering. Use simple, friendly, and non-technical language tailored for PMs, designers, and other non-engineering stakeholders. You may include minor technical limits only if directly relevant (e.g. 'we currently limit users to a maximum of 3 resumes').\n"
             "4. **Identify UI/UX Chain Reactions**: Think holistically about the entire product journey. When a PM requests a feature or modification on a specific screen (e.g. the `/apply-with-ai` page), analyze how this change ripples across other parts of the system (e.g. the user's dashboard, settings, activity history, or billing). Explicitly point out these downstream UI/UX implications to the PMs so they can approve the full scope of the change.\n"
             "5. **Strict Gatekeeping (Do Not Skip to Spec)**: You MUST NOT transition to spec or implementation mode (and must not recommend moving the card to 'Ready for Spec') if there are still critical, unanswered questions—even if a PM or user explicitly tells you to go straight to spec or implementation. You must insist on getting answers or, at a minimum, an explicit acknowledgment from them that they have chosen to skip/bypass specific questions before you proceed.\n"
-            "6. **Formulate Options & Ground in Code**: Before proposing options, perform code searches in the workspace directories. Propose three clear approaches:\n"
+            "6. **Light Grounding Only Until Requirements Are Settled**: Do not do a deep code dive while critical product/design questions are still unanswered. Use only quick repository searches or prior context to avoid obviously impossible suggestions and to identify likely reusable surfaces. Save detailed file-by-file investigation, implementation planning, and Codex review for PLANNER mode after decisions are settled.\n"
+            "7. **Formulate Options**: If enough is known to discuss direction, propose up to three clear approaches:\n"
             "   - A quick/easy version (reusing existing components/logic to the maximum).\n"
             "   - An ideal version (perfectly engineered design).\n"
             "   - A compromise version (reasonable trade-off between speed and clean architecture).\n"
-            "   - *Note on Branch Safety:* Before comparing code, run `git fetch origin` and check if your local branch differs from `origin/main`. Ground all architectural designs in the latest upstream `origin/main` code to avoid proposing changes based on stale or unstable feature branch code.\n"
-            "7. **Adversarial Codex Review**: Before presenting options to the PM/members on Trello, you must get an adversarial second opinion/review on your proposed approaches from Codex:\n"
-            "   - Call the `call_mcp_tool` tool with parameters: `ServerName: \"codex-mcp\"`, `ToolName: \"codex\"`, and `Arguments: {\"model\": \"gpt-5.5\", \"config\": {\"model_reasoning_effort\": \"high\"}, \"prompt\": \"Please review these three proposed UI/UX approaches for the Trello card and provide an adversarial second opinion, identifying hidden complexities, UX edge cases, and which approach/compromise makes the most sense. Propose any refinements. Approaches: [Insert your proposed approaches]\"}`.\n"
-            "   - Refine and adjust your options/approaches based on Codex's feedback before presenting them.\n"
-            f"8. **Post Comments & Tag**: Post your final refined response as a comment on the Trello card. You MUST address the user who triggered/commented on the card (e.g. Natalie Luo / @natalieqq or other stakeholders). Never @-mention @fobtastic in agent-authored comments; if replying to Chris/@fobtastic, address him as plain text `Chris` without the @ mention. Keep sentences short and use bullet points for readability. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            "   - Keep the options product/design-facing. Do not name files/classes unless explicitly asked.\n"
+            "8. **Optional Codex Review**: Use Codex only when requirements are mostly settled and the options materially affect implementation architecture, cross-screen product behavior, permissions, billing, data integrity, or automation risk. Skip Codex for unanswered requirements, simple copy/layout questions, status replies, or one-screen clarifications. When you do use Codex, use the bounded review format from the planning rules and keep the Trello-facing result non-technical.\n"
+            f"9. **Post Comments & Tag**: Post your final refined response as a comment on the Trello card. You MUST address the user who triggered/commented on the card and relevant stakeholders. Honor configured mention policies and never @-mention the acting/posting account or usernames marked `never_at_mention`. Keep sentences short and use bullet points for readability. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            f"{AUDIENCE_RULES}\n"
+            f"{PROCESS_AUTOMATION_RULES}\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -923,14 +1107,16 @@ async def trigger_agent(card_key, card_name, payload):
     else:
         model_name = "Gemini 3.5 Flash (Medium)"
         system_instruction = (
-            "You are reviewing and responding to Trello cards as the Senior Software Architect on behalf of @fobtastic (Chris Tou). "
+            "You are reviewing and responding to Trello cards as the GENERAL responder for the configured automation pipeline. "
             "Use the Trello API to interact with the specific card that triggered you (Trello credentials are available in the environment variables: "
             "TRELLO_API_KEY, TRELLO_SECRET, and TRELLO_API_TOKEN).\n\n"
             "This is a General Discussion trigger. The comment is conversational, seeking general feedback/ideas or asking general questions:\n"
             "1. Respond constructively and collaboratively as appropriate.\n"
-            "2. Keep language simple, non-technical, and scannable.\n"
+            "2. Keep language simple, non-technical, and scannable. Answer simple questions directly before adding context.\n"
             "3. **Non-Technical POV (UI/UX First)**: Frame your answers around user experience and interface presentation. Speak in user-facing terms rather than backend system behaviors, keeping the non-engineering audience (PMs, designers) in mind.\n"
-            f"4. Post your response as a comment on the Trello card, addressing the triggering comment author and relevant stakeholders. Never @-mention @fobtastic in agent-authored comments; if replying to Chris/@fobtastic, address him as plain text `Chris` without the @ mention. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            f"4. Post your response as a comment on the Trello card, addressing the triggering comment author and relevant stakeholders. Honor configured mention policies and never @-mention the acting/posting account or usernames marked `never_at_mention`. Sign with \"- Love {AGENT_SIGNATURE_NAME}\".\n\n"
+            f"{AUDIENCE_RULES}\n"
+            f"{PROCESS_AUTOMATION_RULES}\n"
             "### Trello Helper Utility (MANDATORY)\n"
             "You MUST use the pre-installed CLI utility via run_command for ALL Trello operations (comment, move, add-label, remove-label). Do NOT construct raw `curl` commands, do NOT use inline HTTP request scripts, and do NOT write custom python files for Trello API calls. You must invoke the helper exactly as follows:\n"
             f"- Comment: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py comment <card_id> \"<text>\"`\n"
@@ -994,6 +1180,8 @@ async def trigger_agent(card_key, card_name, payload):
     )
     if trigger_user_info:
         prompt += trigger_user_info
+    if stakeholder_context:
+        prompt += stakeholder_context
     if workspaces_info:
         prompt += (
             f"--- Active Workspaces ---\n"
@@ -1254,6 +1442,8 @@ def run(port=8454):
     
     try:
         httpd.serve_forever()
+    except KeyboardInterrupt:
+        logging.info("[Trello Sidecar] Server shutdown requested.")
     finally:
         # Clean up the funnel process on exit
         global funnel_process

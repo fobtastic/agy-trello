@@ -68,10 +68,13 @@ These can be configured in your `.env` or inside the systemd service file:
 
 ### Runaway Conversation Controls
 The receiver includes deterministic guardrails to prevent bot-to-bot loops and duplicate work:
-- `TRELLO_AGENT_TRELLO_USERNAME`: Trello username for the account this sidecar posts as. Defaults to `fobtastic`.
-- `TRELLO_SUPPRESSED_TRIGGER_USERNAMES`: Comma-separated Trello usernames that should never trigger an agent run. Defaults to `trello,butler`. Add other automation/bot accounts here as they are identified. Do not add `fobtastic` unless you intentionally want to ignore Chris's manual comments too.
+- `TRELLO_AGENT_TRELLO_USERNAME`: Trello username for the account this sidecar posts as. Used to avoid self-mention loops. No source-level default is provided because deployments may post through different human or automation accounts.
+- `TRELLO_SUPPRESSED_TRIGGER_USERNAMES`: Comma-separated Trello usernames that should never trigger an agent run. Defaults to `trello,butler`. Add other automation/bot accounts here as they are identified. Do not add the acting account if that same account can also leave intentional human comments.
 - `TRELLO_SUPPRESSED_COMMENT_REGEX`: Regex for comment bodies that should never trigger an agent run. Defaults to the configured `- Love <signature>` and legacy planner/investigator signatures.
-- `TRELLO_NEVER_MENTION_USERNAMES`: Comma-separated Trello usernames that the helper must never @-mention in agent-authored comments. Defaults to `fobtastic`; the helper rewrites those mentions to plain text before posting.
+- `TRELLO_NEVER_MENTION_USERNAMES`: Comma-separated Trello usernames that the helper must never @-mention in agent-authored comments. The helper rewrites those mentions to plain text before posting.
+- `TRELLO_MENTION_REPLACEMENTS_JSON`: Optional JSON object mapping Trello usernames to plain-text replacements, for example `{"owner_username":"Owner Name"}`.
+- `TRELLO_STAKEHOLDER_CONTEXT_FILE`: Optional path to a local JSON roster. Defaults to `~/.gemini/antigravity-cli/trello_stakeholders.json` when present.
+- `TRELLO_STAKEHOLDER_CONTEXT_JSON`: Optional inline JSON roster for managed deployments. Prefer the file path for local development.
 - `TRELLO_POST_ACK_COMMENTS`: Whether to post an immediate "Got it" acknowledgement comment before the agent finishes. Defaults to `false` because ack comments can wake other board automations/bots.
 - `TRELLO_TRIGGER_COOLDOWN_SECONDS`: Suppresses repeated identical triggers on the same card inside this window. Defaults to `300`.
 - `TRELLO_MAX_RECENT_TRIGGER_IDS`: Number of Trello action IDs remembered for replay suppression. Defaults to `500`.
@@ -80,6 +83,38 @@ Runtime trigger state is persisted locally under:
 `~/.gemini/antigravity-cli/trello_sidecar_state.json`
 
 The sidecar also keeps a single queued/running agent slot per Trello card. If several events arrive while a card is already being processed, only the first is accepted and the rest are ignored.
+
+Example stakeholder context:
+
+```json
+{
+  "users": [
+    {
+      "trello_username": "product_owner",
+      "display_name": "Product Owner",
+      "role": "owner",
+      "authority": "final decision maker",
+      "preferred_address": "Product Owner",
+      "mention_policy": "never_at_mention",
+      "tone": "brief, product-facing",
+      "notes": "Tagging this account may trigger board automation."
+    },
+    {
+      "trello_username": "designer_username",
+      "display_name": "Designer",
+      "role": "designer",
+      "authority": "design decisions",
+      "preferred_address": "Designer",
+      "mention_policy": "direct_reply_only",
+      "tone": "design-facing, nontechnical"
+    }
+  ],
+  "rules": [
+    "Treat support reports as close to customer experience.",
+    "Ask product/design questions before deep code investigation."
+  ]
+}
+```
 
 ---
 
@@ -142,6 +177,22 @@ Before a **PLANNER / Ready for Spec** run, the sidecar searches the configured w
 - Normalized card title keywords.
 
 Those results are injected into the agent prompt as a mandatory preflight section. The planner is instructed to update or link existing GitHub issues/PRs instead of creating duplicates, and to stop for human confirmation when duplicate status is unclear.
+
+---
+
+## Audience & Process Automation Rules
+
+- Trello comments are kept short and product-facing for PMs, designers, QA, and reporters.
+- Technical implementation detail belongs in GitHub issues, not Trello comments.
+- Investigator mode does only light code grounding while product/design questions are unresolved; deep code dives and Codex review are reserved for planner mode after requirements settle.
+- If related PRs are already merged/deployed and new changes are requested, the sidecar treats them as follow-up work and links back to the original card for context.
+- Deployment-specific stakeholder names, roles, usernames, and mention policies belong in local stakeholder context, not committed source.
+
+---
+
+## Public Release Privacy
+
+Before making this repository public, scan and scrub both the working tree and git history for private stakeholder names, usernames, project paths, board/card URLs, and secrets. Deleting private data from current files is not enough for an open source release; plan a deliberate history rewrite and fresh verification pass.
 
 ---
 

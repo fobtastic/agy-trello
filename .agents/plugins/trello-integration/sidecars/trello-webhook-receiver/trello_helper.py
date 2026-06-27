@@ -24,14 +24,78 @@ load_zshrc_env()
 
 API_KEY = os.environ.get("TRELLO_API_KEY")
 API_TOKEN = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
-NEVER_MENTION_USERNAMES = [
-    username.strip().lower()
-    for username in os.environ.get("TRELLO_NEVER_MENTION_USERNAMES", "fobtastic").split(",")
-    if username.strip()
-]
-MENTION_REPLACEMENTS = {
-    "fobtastic": os.environ.get("TRELLO_FOBTASTIC_DISPLAY_NAME", "Chris")
-}
+AGENT_TRELLO_USERNAME = os.environ.get("TRELLO_AGENT_TRELLO_USERNAME", "").strip().lower()
+
+def normalize_username(value):
+    return str(value or "").strip().lower().lstrip("@")
+
+def parse_csv_usernames(value):
+    return {
+        normalize_username(username)
+        for username in str(value or "").split(",")
+        if normalize_username(username)
+    }
+
+def load_json_value(raw, source):
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        print(f"Warning: Failed to parse {source}: {e}", file=sys.stderr)
+        return None
+
+def load_stakeholder_context():
+    raw_context = os.environ.get("TRELLO_STAKEHOLDER_CONTEXT_JSON")
+    source = "TRELLO_STAKEHOLDER_CONTEXT_JSON"
+    if not raw_context:
+        path = os.environ.get(
+            "TRELLO_STAKEHOLDER_CONTEXT_FILE",
+            os.path.expanduser("~/.gemini/antigravity-cli/trello_stakeholders.json"),
+        )
+        if path and os.path.exists(os.path.expanduser(path)):
+            source = os.path.expanduser(path)
+            try:
+                with open(source, "r") as f:
+                    raw_context = f.read()
+            except Exception as e:
+                print(f"Warning: Failed to read stakeholder context file {source}: {e}", file=sys.stderr)
+                return {}
+    parsed = load_json_value(raw_context, source)
+    return parsed if isinstance(parsed, dict) else {}
+
+def build_mention_policy():
+    never_mention = parse_csv_usernames(os.environ.get("TRELLO_NEVER_MENTION_USERNAMES"))
+    if AGENT_TRELLO_USERNAME:
+        never_mention.add(AGENT_TRELLO_USERNAME)
+
+    replacements = {}
+    replacement_config = load_json_value(
+        os.environ.get("TRELLO_MENTION_REPLACEMENTS_JSON"),
+        "TRELLO_MENTION_REPLACEMENTS_JSON",
+    )
+    if isinstance(replacement_config, dict):
+        for username, replacement in replacement_config.items():
+            normalized = normalize_username(username)
+            if normalized and replacement:
+                replacements[normalized] = str(replacement)
+
+    stakeholder_context = load_stakeholder_context()
+    for user in stakeholder_context.get("users", []):
+        if not isinstance(user, dict):
+            continue
+        username = normalize_username(user.get("trello_username"))
+        if not username:
+            continue
+        if str(user.get("mention_policy", "")).strip().lower() == "never_at_mention":
+            never_mention.add(username)
+        replacement = user.get("preferred_address") or user.get("display_name") or username
+        if replacement:
+            replacements.setdefault(username, str(replacement))
+
+    return sorted(never_mention), replacements
+
+NEVER_MENTION_USERNAMES, MENTION_REPLACEMENTS = build_mention_policy()
 
 if not API_KEY or not API_TOKEN:
     print("Error: Missing TRELLO_API_KEY or TRELLO_API_TOKEN in environment / ~/.zshrc")
