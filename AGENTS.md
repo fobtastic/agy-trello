@@ -63,6 +63,13 @@ Guidance for future coding agents working on this Antigravity Trello sidecar.
 - If related PRs are already merged or deployed and the reporter asks for additional changes, treat it as follow-up work. Prefer a new Trello card/GitHub issue linked back to the original card for context.
 - If work is still active in an open issue/PR, update/link that active work instead of creating new duplicates.
 
+## Structured Logging
+
+- Runtime state lives at `~/.gemini/antigravity-cli/trello_sidecar_state.json`.
+- Dashboard-oriented JSONL events live at `~/.gemini/antigravity-cli/trello_sidecar_events.jsonl` unless `TRELLO_SIDECAR_EVENT_LOG_FILE` overrides the path.
+- Log compact facts: trigger accepted/ignored, reason, phase, card ID/name/link, action ID/type, member username/name, conversation ID, run duration, return code, and issue/PR links when future code adds them.
+- Do not log full Trello payloads, full comment bodies, stdout/stderr, credentials, env values, or raw tokens. Use hashes/lengths for comment correlation.
+
 ## Codex MCP Review
 
 - Use Codex as a bounded reviewer, not a co-author that rewrites the whole plan.

@@ -87,6 +87,12 @@ The receiver includes deterministic guardrails to prevent bot-to-bot loops and d
 Runtime trigger state is persisted locally under:
 `~/.gemini/antigravity-cli/trello_sidecar_state.json`
 
+Structured sidecar events are appended locally under:
+`~/.gemini/antigravity-cli/trello_sidecar_events.jsonl`
+
+Override the path with:
+- `TRELLO_SIDECAR_EVENT_LOG_FILE`: Path to the JSONL event log.
+
 The sidecar also keeps a single queued/running agent slot per Trello card. If several events arrive while a card is already being processed, only the first is accepted and the rest are ignored.
 
 Agent-to-agent comments are allowed when they add meaningful new content. Probable agent comments are suppressed only when they are low novelty, such as acknowledgement/status pings, mention-only chatter, repeated wording, or parroting recent comments without a new question, decision, bug detail, repro step, URL/screenshot/mockup, issue/PR link, requirement change, or explicit action request.
@@ -211,7 +217,20 @@ The sidecar prompts tell Agy/Codex to use Superpowers-style discipline when avai
 
 ## Dashboard Direction
 
-The sidecar should stay lightweight while behavior is still evolving. For a future dashboard, prefer emitting structured sidecar events first (trigger accepted/ignored, phase, card, related issues/PRs, run duration, outcome, duplicate decisions). A Laravel dashboard can later consume those events and local/session state without forcing the webhook runner itself to become Laravel immediately.
+The sidecar should stay lightweight while behavior is still evolving. It now emits structured JSONL events that a future dashboard can import without forcing the webhook runner itself to become Laravel immediately.
+
+Current event types include:
+- `trigger_accepted`
+- `trigger_ignored`
+- `trigger_classified`
+- `ack_posted`
+- `agent_run_started`
+- `conversation_linked`
+- `agent_run_completed`
+- `agent_run_failed`
+- `agent_run_error`
+
+Events include compact fields such as card ID/name/link, action ID/type, member username/name, phase, reason, model, conversation ID, run duration, return code, comment hash, and comment length. Full comment bodies, raw payloads, stdout/stderr, and obvious token/key query values are not written to the event log.
 
 ---
 

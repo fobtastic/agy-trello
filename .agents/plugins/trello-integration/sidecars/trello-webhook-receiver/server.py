@@ -371,6 +371,10 @@ def cleanup_processes():
 # 4. Session/Conversation Tracking (Resuming specific card conversations)
 SESSION_MAP_FILE = os.path.expanduser("~/.gemini/antigravity-cli/trello_sessions.json")
 SIDECAR_STATE_FILE = os.path.expanduser("~/.gemini/antigravity-cli/trello_sidecar_state.json")
+SIDECAR_EVENT_LOG_FILE = os.environ.get(
+    "TRELLO_SIDECAR_EVENT_LOG_FILE",
+    os.path.expanduser("~/.gemini/antigravity-cli/trello_sidecar_events.jsonl"),
+)
 state_lock = threading.Lock()
 pending_cards = set()
 
@@ -408,6 +412,38 @@ def save_sidecar_state(state):
             json.dump(state, f, indent=2)
     except Exception as e:
         logging.error(f"[Trello Sidecar] Error saving sidecar state: {e}")
+
+def sanitize_event_value(value):
+    if isinstance(value, str):
+        return redact_sensitive(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [sanitize_event_value(item) for item in value[:20]]
+    if isinstance(value, dict):
+        return {
+            str(key): sanitize_event_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in {"comment", "comments", "payload", "body", "text", "stdout", "stderr"}
+        }
+    return redact_sensitive(value)
+
+def log_sidecar_event(event_name, details=None):
+    event = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": str(event_name),
+    }
+    for key, value in (details or {}).items():
+        key = str(key)
+        if key.lower() in {"comment", "comments", "payload", "body", "text", "stdout", "stderr"}:
+            continue
+        event[key] = sanitize_event_value(value)
+    try:
+        os.makedirs(os.path.dirname(SIDECAR_EVENT_LOG_FILE), exist_ok=True)
+        with open(SIDECAR_EVENT_LOG_FILE, "a") as f:
+            f.write(json.dumps(event, sort_keys=True) + "\n")
+    except Exception as e:
+        logging.warning("[Trello Sidecar] Failed to write sidecar event log: %s", redact_sensitive(e))
 
 def find_new_conversation_id(before_dirs):
     brain_dir = os.path.expanduser("~/.gemini/antigravity-cli/brain")
@@ -559,6 +595,31 @@ def extract_action_id(payload):
 def extract_action_type(payload):
     action_data = extract_action(payload)
     return action_data.get("type") or payload.get("actionType") or "unknown"
+
+def trigger_event_details(card_key, card_name, payload, comment, list_name, reason=None):
+    username, display_name = extract_trigger_member(payload)
+    details = {
+        "card_id": str(card_key or ""),
+        "card_name": str(card_name or ""),
+        "card_link": payload.get("cardLink"),
+        "action_id": extract_action_id(payload),
+        "action_type": extract_action_type(payload),
+        "member_username": username,
+        "member_name": display_name,
+        "list_name": list_name,
+        "comment_hash": hashlib.sha256(str(comment or "").encode("utf-8")).hexdigest() if comment else None,
+        "comment_length": len(str(comment or "")),
+        "probable_agent_comment": is_probable_agent_comment(comment, username, display_name),
+    }
+    if reason:
+        details["reason"] = reason
+    return details
+
+def log_trigger_ignored(card_key, card_name, payload, comment, list_name, reason):
+    log_sidecar_event("trigger_ignored", trigger_event_details(card_key, card_name, payload, comment, list_name, reason))
+
+def log_trigger_accepted(card_key, card_name, payload, comment, list_name):
+    log_sidecar_event("trigger_accepted", trigger_event_details(card_key, card_name, payload, comment, list_name))
 
 def normalize_trigger_text(text):
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
@@ -723,6 +784,7 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
             card_name,
             username or display_name,
         )
+        log_trigger_ignored(card_key, card_name, payload, comment, list_name, "suppressed_trigger_member")
         return False, "suppressed_trigger_member"
     if is_probable_agent_comment(comment, username, display_name):
         recent_comments = extract_recent_comment_texts(payload)
@@ -732,6 +794,7 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
                 card_name,
                 username or display_name,
             )
+            log_trigger_ignored(card_key, card_name, payload, comment, list_name, "low_novelty_agent_comment")
             return False, "low_novelty_agent_comment"
 
     action_id = extract_action_id(payload)
@@ -740,6 +803,7 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
     with state_lock:
         if card_key in pending_cards:
             logging.info("[Trello Sidecar] Ignoring duplicate trigger while card '%s' already has a queued/running agent.", card_name)
+            log_trigger_ignored(card_key, card_name, payload, comment, list_name, "card_already_running")
             return False, "card_already_running"
 
         state = load_sidecar_state()
@@ -747,6 +811,7 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
         recent_ids = {entry.get("id") for entry in recent_triggers if entry.get("id")}
         if action_id and action_id in recent_ids:
             logging.info("[Trello Sidecar] Ignoring already-seen Trello action %s for card '%s'.", action_id, card_name)
+            log_trigger_ignored(card_key, card_name, payload, comment, list_name, "duplicate_action")
             return False, "duplicate_action"
 
         card_activity = state.setdefault("card_activity", {})
@@ -758,6 +823,7 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
                 card_name,
                 TRIGGER_COOLDOWN_SECONDS,
             )
+            log_trigger_ignored(card_key, card_name, payload, comment, list_name, "trigger_cooldown")
             return False, "trigger_cooldown"
 
         if action_id:
@@ -771,6 +837,7 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
         pending_cards.add(card_key)
         save_sidecar_state(state)
 
+    log_trigger_accepted(card_key, card_name, payload, comment, list_name)
     return True, "accepted"
 
 def release_pending_card(card_key):
@@ -1181,9 +1248,23 @@ async def trigger_agent(card_key, card_name, payload):
     # Perform semantic classification
     phase = await classify_action(comment, card_name, card_desc, list_name)
     logging.info(f"[Trello Sidecar] Determined phase: {phase} for card '{card_name}'")
+    log_sidecar_event("trigger_classified", {
+        "card_id": card_key,
+        "card_name": card_name,
+        "card_link": payload.get("cardLink"),
+        "phase": phase,
+        "list_name": list_name,
+        "action_id": extract_action_id(payload),
+    })
     if card_id and reserve_ack_comment(card_key, phase):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, post_trello_comment, card_id, build_ack_comment())
+        log_sidecar_event("ack_posted", {
+            "card_id": card_key,
+            "card_name": card_name,
+            "card_link": payload.get("cardLink"),
+            "phase": phase,
+        })
     github_work_context = collect_github_work_context(card_name, payload.get("cardLink")) if phase == "READY_FOR_SPEC" else ""
     stakeholder_context = build_stakeholder_context_block(trigger_username)
     
@@ -1399,6 +1480,15 @@ async def trigger_agent(card_key, card_name, payload):
     
     target_cwd = WORKSPACES[0] if WORKSPACES else None
     process = None
+    started_at = time.time()
+    log_sidecar_event("agent_run_started", {
+        "card_id": card_key,
+        "card_name": card_name,
+        "card_link": payload.get("cardLink"),
+        "model": model_name,
+        "conversation_id": conversation_id,
+        "workspace": target_cwd,
+    })
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1419,6 +1509,12 @@ async def trigger_agent(card_key, card_name, payload):
                         if alias:
                             session_map[alias] = new_id
                     save_session_mapping(session_map)
+                    log_sidecar_event("conversation_linked", {
+                        "card_id": card_key,
+                        "card_name": card_name,
+                        "card_link": payload.get("cardLink"),
+                        "conversation_id": new_id,
+                    })
                     break
         
         stdout, stderr = await process.communicate()
@@ -1426,12 +1522,40 @@ async def trigger_agent(card_key, card_name, payload):
         if process.returncode == 0:
             logging.info(f"[Trello Sidecar] Agent task completed successfully for card '{card_name}'")
             logging.info(f"[Trello Sidecar] Output:\n{stdout.decode()}")
+            log_sidecar_event("agent_run_completed", {
+                "card_id": card_key,
+                "card_name": card_name,
+                "card_link": payload.get("cardLink"),
+                "model": model_name,
+                "conversation_id": conversation_id,
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "returncode": process.returncode,
+            })
         else:
             logging.error(f"[Trello Sidecar] Agent process exited with code {process.returncode} for card '{card_name}'")
             logging.error(f"[Trello Sidecar] Stderr:\n{stderr.decode()}")
+            log_sidecar_event("agent_run_failed", {
+                "card_id": card_key,
+                "card_name": card_name,
+                "card_link": payload.get("cardLink"),
+                "model": model_name,
+                "conversation_id": conversation_id,
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "returncode": process.returncode,
+            })
             raise RuntimeError(f"Agent failed with code {process.returncode}")
     except Exception as e:
         logging.error(f"[Trello Sidecar] Error executing agy CLI subprocess: {e}")
+        if not process or process.returncode is None:
+            log_sidecar_event("agent_run_error", {
+                "card_id": card_key,
+                "card_name": card_name,
+                "card_link": payload.get("cardLink"),
+                "model": model_name,
+                "conversation_id": conversation_id,
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "error": redact_sensitive(e),
+            })
         raise
     finally:
         if process and process in active_processes:

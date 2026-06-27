@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import time
 import unittest
@@ -19,7 +20,9 @@ def load_server():
     spec = importlib.util.spec_from_file_location("trello_sidecar_server", SERVER_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.SIDECAR_STATE_FILE = str(Path(tempfile.mkdtemp()) / "sidecar_state.json")
+    tempdir = Path(tempfile.mkdtemp())
+    module.SIDECAR_STATE_FILE = str(tempdir / "sidecar_state.json")
+    module.SIDECAR_EVENT_LOG_FILE = str(tempdir / "sidecar_events.jsonl")
     module.pending_cards.clear()
     return module
 
@@ -126,6 +129,72 @@ class SidecarPolicyTests(unittest.TestCase):
             helper.ensure_agent_comment_marker(marked).count("[agy-sidecar:comment]"),
             1,
         )
+
+    def test_structured_event_log_appends_redacted_jsonl(self):
+        server = load_server()
+
+        server.log_sidecar_event(
+            "trigger_ignored",
+            {
+                "card_id": "card-123",
+                "card_name": "Card",
+                "reason": "suppressed_trigger_member",
+                "url": "https://api.trello.com/1/cards/card-123?key=secret-key&token=secret-token",
+                "comment": "This full comment body should not be logged",
+            },
+        )
+
+        lines = Path(server.SIDECAR_EVENT_LOG_FILE).read_text().strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        event = json.loads(lines[0])
+        self.assertEqual(event["event"], "trigger_ignored")
+        self.assertEqual(event["card_id"], "card-123")
+        self.assertEqual(event["reason"], "suppressed_trigger_member")
+        self.assertNotIn("comment", event)
+        self.assertEqual(event["url"], "https://api.trello.com/1/cards/card-123?key=[REDACTED]&token=[REDACTED]")
+        self.assertIn("ts", event)
+
+    def test_trigger_decision_logs_accept_and_ignore_events(self):
+        server = load_server()
+
+        ignored, reason = server.should_accept_trigger(
+            "card-ignored",
+            "Ignored Card",
+            {
+                "action": {
+                    "id": "action-ignored",
+                    "type": "commentCard",
+                    "memberCreator": {"username": "trello", "fullName": "Trello Automation"},
+                }
+            },
+            "Automation ping",
+            "Ideas",
+        )
+        accepted, accepted_reason = server.should_accept_trigger(
+            "card-accepted",
+            "Accepted Card",
+            {
+                "action": {
+                    "id": "action-accepted",
+                    "type": "commentCard",
+                    "memberCreator": {"username": "human-user", "fullName": "Human User"},
+                }
+            },
+            "Can we make this empty state clearer?",
+            "Ideas",
+        )
+
+        self.assertFalse(ignored)
+        self.assertEqual(reason, "suppressed_trigger_member")
+        self.assertTrue(accepted)
+        self.assertEqual(accepted_reason, "accepted")
+        events = [
+            json.loads(line)
+            for line in Path(server.SIDECAR_EVENT_LOG_FILE).read_text().strip().splitlines()
+        ]
+        self.assertEqual([event["event"] for event in events], ["trigger_ignored", "trigger_accepted"])
+        self.assertEqual(events[0]["reason"], "suppressed_trigger_member")
+        self.assertEqual(events[1]["card_id"], "card-accepted")
 
 
 if __name__ == "__main__":
