@@ -48,6 +48,8 @@ Guidance for future coding agents working on this Antigravity Trello sidecar.
 - Trello is for PMs, designers, QA, and reporters. Keep Trello comments short, plain-language, and product-facing.
 - Default Trello responses should be under 120 words or 3-6 bullets.
 - Do not include file paths, class names, API routes, database fields, command/tool narration, or architecture details in Trello comments unless explicitly asked.
+- Do NOT post the detailed technical specification, file paths, class names, or database schemas as a Trello comment. Instead, write the detailed technical spec inside the GitHub issue bodies, and post only a short, product-focused, non-technical summary on the Trello card along with links to the created GitHub issues.
+- During the PLANNER (spec-writing) phase, the agent must remain strictly read-only. Do not write or modify any files in the codebase, even as a "proof-of-concept". Save all code modifications for the implementation phase.
 - For design-facing replies, talk about user flow, screen behavior, visual states, copy, layout, and decisions needed.
 - Technical detail belongs in GitHub issues and PRs, not Trello card comments.
 - Simple questions should get direct answers first. Do not restart planning, create issues, or move cards unless explicitly requested.
