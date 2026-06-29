@@ -25,9 +25,9 @@ load_zshrc_env()
 API_KEY = os.environ.get("TRELLO_API_KEY")
 API_TOKEN = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
 AGENT_TRELLO_USERNAME = os.environ.get("TRELLO_AGENT_TRELLO_USERNAME", "").strip().lower()
-AGENT_COMMENT_MARKER = os.environ.get("TRELLO_AGENT_COMMENT_MARKER", "[agy-sidecar:comment]")
-AGENT_ACK_MARKER = os.environ.get("TRELLO_AGENT_ACK_MARKER", "[agy-sidecar:ack]")
-AGENT_STATUS_MARKER = os.environ.get("TRELLO_AGENT_STATUS_MARKER", "[agy-sidecar:status]")
+AGENT_COMMENT_MARKER = os.environ.get("TRELLO_AGENT_COMMENT_MARKER", "<!-- [agy-sidecar:comment] -->")
+AGENT_ACK_MARKER = os.environ.get("TRELLO_AGENT_ACK_MARKER", "<!-- [agy-sidecar:ack] -->")
+AGENT_STATUS_MARKER = os.environ.get("TRELLO_AGENT_STATUS_MARKER", "<!-- [agy-sidecar:status] -->")
 
 def normalize_username(value):
     return str(value or "").strip().lower().lstrip("@")
@@ -146,8 +146,10 @@ def sanitize_forbidden_mentions(text):
     return sanitized
 
 def ensure_agent_comment_marker(text):
-    markers = [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]
-    if any(marker and marker in text for marker in markers):
+    legacy_markers = ["[agy-sidecar:comment]", "[agy-sidecar:ack]", "[agy-sidecar:status]"]
+    current_markers = [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]
+    all_markers = list(set(current_markers + legacy_markers))
+    if any(marker and marker in text for marker in all_markers):
         return text
     if not AGENT_COMMENT_MARKER:
         return text

@@ -115,7 +115,7 @@ class SidecarPolicyTests(unittest.TestCase):
 
         ack = server.build_ack_comment()
 
-        self.assertIn("[agy-sidecar:ack]", ack)
+        self.assertIn("<!-- [agy-sidecar:ack] -->", ack)
         self.assertNotIn("@", ack)
 
     def test_helper_appends_substantive_agent_marker_once(self):
@@ -123,12 +123,16 @@ class SidecarPolicyTests(unittest.TestCase):
 
         marked = helper.ensure_agent_comment_marker("Question: should we keep this modal?")
 
-        self.assertIn("[agy-sidecar:comment]", marked)
-        self.assertEqual(marked.count("[agy-sidecar:comment]"), 1)
+        self.assertIn("<!-- [agy-sidecar:comment] -->", marked)
+        self.assertEqual(marked.count("<!-- [agy-sidecar:comment] -->"), 1)
         self.assertEqual(
-            helper.ensure_agent_comment_marker(marked).count("[agy-sidecar:comment]"),
+            helper.ensure_agent_comment_marker(marked).count("<!-- [agy-sidecar:comment] -->"),
             1,
         )
+
+        # Ensure legacy markers are recognized and NOT duplicated or overwritten
+        legacy_marked = "Question: should we keep this modal?\n\n[agy-sidecar:comment]"
+        self.assertEqual(helper.ensure_agent_comment_marker(legacy_marked), legacy_marked)
 
     def test_structured_event_log_appends_redacted_jsonl(self):
         server = load_server()

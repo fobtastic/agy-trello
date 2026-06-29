@@ -234,9 +234,9 @@ POST_ACK_COMMENTS = os.environ.get("TRELLO_POST_ACK_COMMENTS", "false").strip().
 TRIGGER_COOLDOWN_SECONDS = get_env_int("TRELLO_TRIGGER_COOLDOWN_SECONDS", 300)
 MAX_RECENT_TRIGGERS = get_env_int("TRELLO_MAX_RECENT_TRIGGER_IDS", 500)
 ACK_COOLDOWN_SECONDS = get_env_int("TRELLO_ACK_COOLDOWN_SECONDS", 900)
-AGENT_COMMENT_MARKER = os.environ.get("TRELLO_AGENT_COMMENT_MARKER", "[agy-sidecar:comment]")
-AGENT_ACK_MARKER = os.environ.get("TRELLO_AGENT_ACK_MARKER", "[agy-sidecar:ack]")
-AGENT_STATUS_MARKER = os.environ.get("TRELLO_AGENT_STATUS_MARKER", "[agy-sidecar:status]")
+AGENT_COMMENT_MARKER = os.environ.get("TRELLO_AGENT_COMMENT_MARKER", "<!-- [agy-sidecar:comment] -->")
+AGENT_ACK_MARKER = os.environ.get("TRELLO_AGENT_ACK_MARKER", "<!-- [agy-sidecar:ack] -->")
+AGENT_STATUS_MARKER = os.environ.get("TRELLO_AGENT_STATUS_MARKER", "<!-- [agy-sidecar:status] -->")
 AGENT_COMMENT_USER_REGEX = os.environ.get(
     "TRELLO_AGENT_COMMENT_USER_REGEX",
     r"(?i)(^|[-_\s])(agent|agy|bot)([-_\s]|$)|^(agent|agy|bot)([-_\s]|$)",
@@ -646,7 +646,10 @@ SUBSTANCE_SIGNAL_PATTERNS = [
 
 def strip_agent_markers(text):
     stripped = str(text or "")
-    for marker in [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]:
+    legacy_markers = ["[agy-sidecar:comment]", "[agy-sidecar:ack]", "[agy-sidecar:status]"]
+    current_markers = [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]
+    all_markers = list(set(current_markers + legacy_markers))
+    for marker in all_markers:
         if marker:
             stripped = stripped.replace(marker, " ")
     stripped = re.sub(SUPPRESSED_COMMENT_REGEX, " ", stripped)
@@ -675,7 +678,10 @@ def has_substance_signal(text):
 
 def is_probable_agent_comment(comment, username=None, display_name=None):
     text = str(comment or "")
-    if any(marker and marker in text for marker in [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]):
+    legacy_markers = ["[agy-sidecar:comment]", "[agy-sidecar:ack]", "[agy-sidecar:status]"]
+    current_markers = [AGENT_COMMENT_MARKER, AGENT_ACK_MARKER, AGENT_STATUS_MARKER]
+    all_markers = list(set(current_markers + legacy_markers))
+    if any(marker and marker in text for marker in all_markers):
         return True
     for identity in [username, display_name]:
         if not identity:
@@ -767,7 +773,10 @@ def is_agent_or_suppressed_comment(comment, username):
         return True
     if not comment:
         return False
-    if any(marker and marker in comment for marker in [AGENT_ACK_MARKER, AGENT_STATUS_MARKER]):
+    legacy_markers = ["[agy-sidecar:ack]", "[agy-sidecar:status]"]
+    current_markers = [AGENT_ACK_MARKER, AGENT_STATUS_MARKER]
+    all_markers = list(set(current_markers + legacy_markers))
+    if any(marker and marker in comment for marker in all_markers):
         return True
     try:
         return bool(re.search(SUPPRESSED_COMMENT_REGEX, comment))
