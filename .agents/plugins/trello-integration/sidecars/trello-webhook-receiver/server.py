@@ -850,6 +850,11 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
             "last_seen": now,
             "last_action_id": action_id,
         }
+        state.setdefault("in_flight_cards", {})[str(card_key)] = {
+            "card_name": card_name,
+            "payload": payload,
+            "queued_at": now,
+        }
         pending_cards.add(card_key)
         save_sidecar_state(state)
 
@@ -859,6 +864,9 @@ def should_accept_trigger(card_key, card_name, payload, comment, list_name):
 def release_pending_card(card_key):
     with state_lock:
         pending_cards.discard(card_key)
+        state = load_sidecar_state()
+        if state.get("in_flight_cards", {}).pop(str(card_key), None) is not None:
+            save_sidecar_state(state)
 
 def run_gh_json(args, cwd=None, timeout=12):
     gh_bin = shutil.which("gh")
@@ -1641,6 +1649,26 @@ def start_queue_worker():
     threading.Thread(target=queue_worker, daemon=True).start()
     queue_worker_started = True
 
+def requeue_in_flight_cards():
+    """Re-enqueue cards that were queued/running when the previous process died."""
+    with state_lock:
+        state = load_sidecar_state()
+        in_flight = dict(state.get("in_flight_cards", {}) or {})
+    if not in_flight:
+        return
+    logging.info(f"[Trello Sidecar] Re-enqueueing {len(in_flight)} in-flight card(s) persisted from previous run.")
+    for card_key, entry in in_flight.items():
+        payload = entry.get("payload") or {}
+        card_name_str = entry.get("card_name") or payload.get("cardName") or "Unnamed Card"
+        with state_lock:
+            pending_cards.add(card_key)
+        task_queue.put((card_key, card_name_str, payload))
+        log_sidecar_event("trigger_requeued", {
+            "card_id": card_key,
+            "card_name": card_name_str,
+            "card_link": payload.get("cardLink"),
+        })
+
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         # Trello sends a HEAD request when verifying the webhook URL
@@ -1802,6 +1830,7 @@ def run(port=8454):
     signal.signal(signal.SIGTERM, sig_handler)
     signal.signal(signal.SIGINT, sig_handler)
     start_queue_worker()
+    requeue_in_flight_cards()
 
     # Bind only to 127.0.0.1 for secure local-only listening when testing/funneling
     server_address = ('127.0.0.1', port)

@@ -211,5 +211,40 @@ class SidecarPolicyTests(unittest.TestCase):
         self.assertEqual(events[1]["card_id"], "card-accepted")
 
 
+    def test_in_flight_cards_persist_requeue_and_clear(self):
+        server = load_server()
+        payload = {
+            "cardName": "Restart Card",
+            "action": {
+                "id": "action-restart",
+                "type": "commentCard",
+                "memberCreator": {"username": "human-user", "fullName": "Human User"},
+            },
+        }
+
+        accepted, _ = server.should_accept_trigger(
+            "card-restart", "Restart Card", payload, "Please look at this", "Ideas"
+        )
+        self.assertTrue(accepted)
+        state = json.loads(Path(server.SIDECAR_STATE_FILE).read_text())
+        self.assertIn("card-restart", state["in_flight_cards"])
+        self.assertEqual(state["in_flight_cards"]["card-restart"]["payload"]["cardName"], "Restart Card")
+
+        # Simulate a process restart: fresh pending set, requeue from persisted state.
+        server.pending_cards.clear()
+        server.requeue_in_flight_cards()
+        card_key, card_name_str, requeued_payload = server.task_queue.get_nowait()
+        self.assertEqual(card_key, "card-restart")
+        self.assertEqual(card_name_str, "Restart Card")
+        self.assertEqual(requeued_payload["cardName"], "Restart Card")
+        self.assertIn("card-restart", server.pending_cards)
+
+        # Completion clears the persisted in-flight entry.
+        server.release_pending_card("card-restart")
+        state = json.loads(Path(server.SIDECAR_STATE_FILE).read_text())
+        self.assertNotIn("card-restart", state.get("in_flight_cards", {}))
+        self.assertNotIn("card-restart", server.pending_cards)
+
+
 if __name__ == "__main__":
     unittest.main()
