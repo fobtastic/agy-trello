@@ -733,6 +733,13 @@ def is_low_signal_agent_comment(comment, recent_comments):
 def build_ack_comment():
     return f"Got it, I am checking this now.\n\n{AGENT_ACK_MARKER}"
 
+def build_failure_comment():
+    return (
+        "I hit a technical snag processing this request and couldn't complete it — "
+        "please re-trigger or ping a human.\n\n"
+        f"{AGENT_STATUS_MARKER}"
+    )
+
 def should_post_ack_comment(card_key, phase, state, now=None):
     if phase not in {"INVESTIGATOR", "READY_FOR_SPEC"}:
         return False
@@ -1499,77 +1506,105 @@ async def trigger_agent(card_key, card_name, payload):
         "conversation_id": conversation_id,
         "workspace": target_cwd,
     })
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=target_cwd
-        )
-        active_processes.add(process)
-        
-        # If starting a new session, discover and log the new conversation ID after launch
-        if not conversation_id:
-            for _ in range(15):
-                await asyncio.sleep(1)
-                new_id = find_new_conversation_id(before_dirs)
-                if new_id:
-                    logging.info(f"[Trello Sidecar] Discovered new conversation ID {new_id} for card '{card_name}'")
-                    for alias in conversation_aliases:
-                        if alias:
-                            session_map[alias] = new_id
-                    save_session_mapping(session_map)
-                    log_sidecar_event("conversation_linked", {
-                        "card_id": card_key,
-                        "card_name": card_name,
-                        "card_link": payload.get("cardLink"),
-                        "conversation_id": new_id,
-                    })
-                    break
-        
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode == 0:
-            logging.info(f"[Trello Sidecar] Agent task completed successfully for card '{card_name}'")
-            logging.info(f"[Trello Sidecar] Output:\n{stdout.decode()}")
-            log_sidecar_event("agent_run_completed", {
+    last_error = None
+    for attempt in range(2):
+        if attempt:
+            logging.warning(f"[Trello Sidecar] Retrying agent run once for card '{card_name}' after failure: {last_error}")
+            log_sidecar_event("agent_run_retry", {
                 "card_id": card_key,
                 "card_name": card_name,
                 "card_link": payload.get("cardLink"),
                 "model": model_name,
                 "conversation_id": conversation_id,
-                "duration_ms": int((time.time() - started_at) * 1000),
-                "returncode": process.returncode,
+                "attempt": attempt + 1,
             })
-        else:
-            logging.error(f"[Trello Sidecar] Agent process exited with code {process.returncode} for card '{card_name}'")
-            logging.error(f"[Trello Sidecar] Stderr:\n{stderr.decode()}")
-            log_sidecar_event("agent_run_failed", {
-                "card_id": card_key,
-                "card_name": card_name,
-                "card_link": payload.get("cardLink"),
-                "model": model_name,
-                "conversation_id": conversation_id,
-                "duration_ms": int((time.time() - started_at) * 1000),
-                "returncode": process.returncode,
-            })
-            raise RuntimeError(f"Agent failed with code {process.returncode}")
-    except Exception as e:
-        logging.error(f"[Trello Sidecar] Error executing agy CLI subprocess: {e}")
-        if not process or process.returncode is None:
-            log_sidecar_event("agent_run_error", {
-                "card_id": card_key,
-                "card_name": card_name,
-                "card_link": payload.get("cardLink"),
-                "model": model_name,
-                "conversation_id": conversation_id,
-                "duration_ms": int((time.time() - started_at) * 1000),
-                "error": redact_sensitive(e),
-            })
-        raise
-    finally:
-        if process and process in active_processes:
-            active_processes.remove(process)
+            process = None
+            started_at = time.time()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=target_cwd
+            )
+            active_processes.add(process)
+
+            # If starting a new session, discover and log the new conversation ID after launch
+            if not conversation_id:
+                for _ in range(15):
+                    await asyncio.sleep(1)
+                    new_id = find_new_conversation_id(before_dirs)
+                    if new_id:
+                        logging.info(f"[Trello Sidecar] Discovered new conversation ID {new_id} for card '{card_name}'")
+                        for alias in conversation_aliases:
+                            if alias:
+                                session_map[alias] = new_id
+                        save_session_mapping(session_map)
+                        log_sidecar_event("conversation_linked", {
+                            "card_id": card_key,
+                            "card_name": card_name,
+                            "card_link": payload.get("cardLink"),
+                            "conversation_id": new_id,
+                        })
+                        break
+
+            stdout, stderr = await process.communicate()
+
+            if process.returncode == 0:
+                logging.info(f"[Trello Sidecar] Agent task completed successfully for card '{card_name}'")
+                logging.info(f"[Trello Sidecar] Output:\n{stdout.decode()}")
+                log_sidecar_event("agent_run_completed", {
+                    "card_id": card_key,
+                    "card_name": card_name,
+                    "card_link": payload.get("cardLink"),
+                    "model": model_name,
+                    "conversation_id": conversation_id,
+                    "duration_ms": int((time.time() - started_at) * 1000),
+                    "returncode": process.returncode,
+                })
+                return
+            else:
+                logging.error(f"[Trello Sidecar] Agent process exited with code {process.returncode} for card '{card_name}'")
+                logging.error(f"[Trello Sidecar] Stderr:\n{stderr.decode()}")
+                log_sidecar_event("agent_run_failed", {
+                    "card_id": card_key,
+                    "card_name": card_name,
+                    "card_link": payload.get("cardLink"),
+                    "model": model_name,
+                    "conversation_id": conversation_id,
+                    "duration_ms": int((time.time() - started_at) * 1000),
+                    "returncode": process.returncode,
+                    "attempt": attempt + 1,
+                })
+                raise RuntimeError(f"Agent failed with code {process.returncode}")
+        except Exception as e:
+            logging.error(f"[Trello Sidecar] Error executing agy CLI subprocess: {e}")
+            if not process or process.returncode is None:
+                log_sidecar_event("agent_run_error", {
+                    "card_id": card_key,
+                    "card_name": card_name,
+                    "card_link": payload.get("cardLink"),
+                    "model": model_name,
+                    "conversation_id": conversation_id,
+                    "duration_ms": int((time.time() - started_at) * 1000),
+                    "error": redact_sensitive(e),
+                })
+            last_error = e
+        finally:
+            if process and process in active_processes:
+                active_processes.remove(process)
+
+    # Both attempts failed: surface the failure on the Trello card, then propagate.
+    logging.error(f"[Trello Sidecar] Agent run failed after retry for card '{card_name}'; posting failure comment.")
+    if card_id:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, post_trello_comment, card_id, build_failure_comment())
+        log_sidecar_event("failure_comment_posted", {
+            "card_id": card_key,
+            "card_name": card_name,
+            "card_link": payload.get("cardLink"),
+        })
+    raise last_error
 
 # Create a thread-safe queue for Trello agent triggers
 task_queue = queue.Queue()

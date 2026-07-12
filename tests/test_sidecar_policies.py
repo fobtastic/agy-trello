@@ -118,6 +118,16 @@ class SidecarPolicyTests(unittest.TestCase):
         self.assertIn("<!-- [agy-sidecar:ack] -->", ack)
         self.assertNotIn("@", ack)
 
+    def test_failure_comment_contains_suppressible_marker_and_no_mentions(self):
+        server = load_server()
+
+        failure = server.build_failure_comment()
+
+        self.assertIn("<!-- [agy-sidecar:status] -->", failure)
+        self.assertNotIn("@", failure)
+        # The failure comment must not re-trigger the webhook loop.
+        self.assertTrue(server.is_agent_or_suppressed_comment(failure, "some-agent-user"))
+
     def test_helper_appends_substantive_agent_marker_once(self):
         helper = load_helper()
 
