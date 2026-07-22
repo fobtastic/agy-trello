@@ -354,6 +354,49 @@ WORKSPACES = [w.strip() for w in WORKSPACES_ENV.split(",") if w.strip()] if WORK
 if WORKSPACES:
     logging.info(f"[Trello Sidecar] Pinning target workspaces to: {WORKSPACES}")
 
+def resolve_target_cwd(card_name, card_desc, list_name, workspaces):
+    if not workspaces:
+        return None
+    if len(workspaces) == 1:
+        return workspaces[0]
+    
+    content_lower = f"{card_name} {card_desc} {list_name}".lower()
+    
+    backend_indicators = [
+        "backend", " be ", "[backend]", "api", "db", "database", 
+        "laravel", "artisan", "migration", "queue", "php", "query", 
+        "server", "worker", "scheduled"
+    ]
+    frontend_indicators = [
+        "frontend", " fe ", "[frontend]", "ui", "design", "css", 
+        "styling", "component", "browser", "click", "page", "react", 
+        "next", "playwright", "scroll", "selector", "modal", "preview", 
+        "zoom", "pixel", "color", "layout", "mobile"
+    ]
+    
+    be_count = sum(1 for ind in backend_indicators if ind in content_lower)
+    fe_count = sum(1 for ind in frontend_indicators if ind in content_lower)
+    
+    fe_ws = next((w for w in workspaces if "frontend" in w.lower() or "fe" in w.lower()), None)
+    be_ws = next((w for w in workspaces if "backend" in w.lower() or "be" in w.lower()), None)
+    
+    # Check if both are requested
+    if fe_count > 0 and be_count > 0 and fe_ws and be_ws:
+        parent_dir = os.path.dirname(fe_ws)
+        logging.info(f"[Trello Sidecar] Card requires BOTH frontend and backend (fe={fe_count}, be={be_count}), resolving to common parent: {parent_dir}")
+        return parent_dir
+    
+    if fe_count > be_count and fe_ws:
+        logging.info(f"[Trello Sidecar] Card resolved to Frontend workspace based on keywords (fe={fe_count}, be={be_count}): {fe_ws}")
+        return fe_ws
+    elif be_count > fe_count and be_ws:
+        logging.info(f"[Trello Sidecar] Card resolved to Backend workspace based on keywords (fe={fe_count}, be={be_count}): {be_ws}")
+        return be_ws
+        
+    logging.info(f"[Trello Sidecar] Keywords balanced or workspace mismatch (fe={fe_count}, be={be_count}), fallback to: {workspaces[0]}")
+    return workspaces[0]
+
+
 # 3. Active Process Tracking for Graceful Cleanup
 active_processes = set()
 
@@ -461,7 +504,7 @@ def find_new_conversation_id(before_dirs):
     return None
 
 async def classify_action(comment, card_name, card_desc, list_name):
-    """Performs a quick classification run using Gemini 3.5 Flash to determine the card's phase semantically."""
+    """Performs a quick classification run using Gemini 3.6 Flash to determine the card's phase semantically."""
     # Direct list name mapping
     clean_list = str(list_name).strip().lower()
     if clean_list in ["ready for spec", "ready for specification"]:
@@ -483,7 +526,7 @@ async def classify_action(comment, card_name, card_desc, list_name):
     cmd = [
         resolve_agy_bin(),
         "--dangerously-skip-permissions",
-        "--model", "Gemini 3.5 Flash (Medium)",
+        "--model", "Gemini 3.6 Flash (Medium)",
         "--print",
         f"Classify the following Trello trigger semantically to determine the expected phase.\n\n"
         f"Card Name: {card_name}\n"
@@ -497,7 +540,7 @@ async def classify_action(comment, card_name, card_desc, list_name):
     ]
     logging.info(f"[Trello Sidecar] Classifying trigger comment semantically...")
     try:
-        target_cwd = WORKSPACES[0] if WORKSPACES else None
+        target_cwd = resolve_target_cwd(card_name, card_desc, list_name, WORKSPACES)
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -1294,7 +1337,7 @@ async def trigger_agent(card_key, card_name, payload):
     
     # Choose the model and configure system instructions based on the phase
     if phase == "READY_FOR_SPEC":
-        model_name = "Gemini 3.5 Flash (Medium)"
+        model_name = "Gemini 3.6 Flash (Medium)"
         system_instruction = (
             "You are reviewing and responding to Trello cards as the PLANNER for the configured automation pipeline. "
             "Use the Trello API to interact with the specific card that triggered you (Trello credentials are available in the environment variables: "
@@ -1366,7 +1409,7 @@ async def trigger_agent(card_key, card_name, payload):
             f"{SUPERPOWERS_RULES}\n"
         )
     elif phase == "INVESTIGATOR":
-        model_name = "Gemini 3.5 Flash (Medium)"
+        model_name = "Gemini 3.6 Flash (Medium)"
         system_instruction = (
             "You are reviewing and responding to Trello cards as the INVESTIGATOR for the configured automation pipeline. "
             "Use the Trello API to interact with the specific card that triggered you (Trello credentials are available in the environment variables: "
@@ -1396,7 +1439,7 @@ async def trigger_agent(card_key, card_name, payload):
             f"- Remove Label: `python3 /home/ubuntu/projects/agy-trello/.agents/plugins/trello-integration/sidecars/trello-webhook-receiver/trello_helper.py remove-label <card_id> \"<label_name>\"`\n"
         )
     else:
-        model_name = "Gemini 3.5 Flash (Medium)"
+        model_name = "Gemini 3.6 Flash (Medium)"
         system_instruction = (
             "You are reviewing and responding to Trello cards as the GENERAL responder for the configured automation pipeline. "
             "Use the Trello API to interact with the specific card that triggered you (Trello credentials are available in the environment variables: "
@@ -1435,6 +1478,8 @@ async def trigger_agent(card_key, card_name, payload):
     brain_dir = os.path.expanduser("~/.gemini/antigravity-cli/brain")
     before_dirs = set(os.listdir(brain_dir)) if os.path.exists(brain_dir) else set()
     
+    target_cwd = resolve_target_cwd(card_name, card_desc, list_name, WORKSPACES)
+
     # Build command to execute agy CLI with auto-approval for tool execution permissions
     cmd = [
         resolve_agy_bin(),
@@ -1447,6 +1492,9 @@ async def trigger_agent(card_key, card_name, payload):
     if WORKSPACES:
         for ws in WORKSPACES:
             cmd.extend(["--add-dir", ws])
+            
+    if target_cwd and target_cwd not in WORKSPACES:
+        cmd.extend(["--add-dir", target_cwd])
             
     # Add conversation resume flag if available
     if conversation_id:
@@ -1503,7 +1551,6 @@ async def trigger_agent(card_key, card_name, payload):
     
     logging.info(f"[Trello Sidecar] Running agy command: {format_command_for_log(cmd)}")
     
-    target_cwd = WORKSPACES[0] if WORKSPACES else None
     process = None
     started_at = time.time()
     log_sidecar_event("agent_run_started", {

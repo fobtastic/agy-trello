@@ -5,7 +5,7 @@ An Antigravity sidecar plugin that acts as an automated webhook receiver. It int
 It supports three distinct behavioral modes depending on the context of the incoming Trello trigger, using semantic classification:
 1. **PLANNER (Ready for Spec)**: Leverages `Gemini 3.1 Pro (High)` to analyze requirements, write specifications, create & relate Frontend (FE) and Backend (BE) GitHub issues, link them back to Trello, and update board statuses (e.g. swap label from 'Ready for Spec' to 'Ready for Implementation').
 2. **INVESTIGATOR**: Leverages `Gemini 3.1 Pro (High)` and the specialized `grill-me` skill (`~/.agents/skills/grill-me/SKILL.md`) to run an interactive interview on requirements. Responses are simplified, non-technical, and brief.
-3. **GENERAL (Conversational)**: Leverages `Gemini 3.5 Flash (Medium)` to handle general questions or discussion comments on cards.
+3. **GENERAL (Conversational)**: Leverages `Gemini 3.6 Flash (Medium)` to handle general questions or discussion comments on cards.
 
 All webhook agent comments are signed with `- Love Maeve`.
 
