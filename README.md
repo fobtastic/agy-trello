@@ -3,9 +3,9 @@
 An Antigravity sidecar plugin that acts as an automated webhook receiver. It intercepts Trello card actions and triggers agent execution cycles via the Antigravity CLI (`agy`).
 
 It supports three distinct behavioral modes depending on the context of the incoming Trello trigger, using semantic classification:
-1. **PLANNER (Ready for Spec)**: Leverages `Gemini 3.1 Pro (High)` to analyze requirements, write specifications, create & relate Frontend (FE) and Backend (BE) GitHub issues, link them back to Trello, and update board statuses (e.g. swap label from 'Ready for Spec' to 'Ready for Implementation').
-2. **INVESTIGATOR**: Leverages `Gemini 3.1 Pro (High)` and the specialized `grill-me` skill (`~/.agents/skills/grill-me/SKILL.md`) to run an interactive interview on requirements. Responses are simplified, non-technical, and brief.
-3. **GENERAL (Conversational)**: Leverages `Gemini 3.6 Flash (Medium)` to handle general questions or discussion comments on cards.
+1. **PLANNER (Ready for Spec)**: Leverages `gemini-pro-orchestrator` (configurable via `TRELLO_AGENT_MODEL`) to analyze requirements, write specifications, create & relate Frontend (FE) and Backend (BE) GitHub issues, link them back to Trello, and update board statuses (e.g. swap label from 'Ready for Spec' to 'Ready for Implementation').
+2. **INVESTIGATOR**: Leverages `gemini-pro-orchestrator` and the specialized `grill-me` skill (`~/.agents/skills/grill-me/SKILL.md`) to run an interactive interview on requirements. Responses are simplified, non-technical, and brief.
+3. **GENERAL (Conversational)**: Leverages `gemini-pro-orchestrator` to handle general questions or discussion comments on cards.
 
 All webhook agent comments are signed with `- Love Maeve`.
 
@@ -51,6 +51,9 @@ The sidecar reads environment variables securely to perform actions and authenti
 ### Local `.env` Support (Highest Priority)
 You can place a `.env` file inside the `sidecars/trello-webhook-receiver/` directory (or the directory where the service is started). Variables defined here take precedence and overwrite variables loaded from systemd environments or `~/.zshrc`.
 - `TRELLO_AGENT_SIGNATURE_NAME`: Configure the name used by the agent to sign its Trello comments (e.g. `TRELLO_AGENT_SIGNATURE_NAME=Maeve`). Defaults to `Agy`.
+- `TRELLO_AGENT_MODEL`: Override the `agy --model` value used for all card phases. Defaults to `gemini-pro-orchestrator`.
+- `TRELLO_CLASSIFIER_MODEL`: Override the `agy --model` value used for semantic phase classification. Defaults to `TRELLO_AGENT_MODEL`.
+- `TRELLO_CODEX_REVIEW_MODEL`: Override the Codex model ID named in the PLANNER review instructions. Defaults to `gpt-6.2-sol`.
 
 ### Trello Authentication
 To communicate with Trello, the service automatically injects the following keys from `~/.zshrc` when running under systemd:
@@ -60,7 +63,16 @@ To communicate with Trello, the service automatically injects the following keys
 
 ### Webhook & Workspace Rules
 These can be configured in your `.env` or inside the systemd service file:
-- `TRELLO_WEBHOOK_TOKEN`: A secure token to authenticate incoming HTTP POST payloads. Must be provided in the headers (`X-Auth-Token` or `Authorization`).
+- `TRELLO_WEBHOOK_TOKEN`: A secure token to authenticate relay POST payloads (`X-Auth-Token` or `Authorization: Bearer <token>`).
+- `TRELLO_WEBHOOK_CALLBACK_URL`: Optional public callback URL registered with Trello; when set alongside `TRELLO_SECRET`, direct Trello webhooks signed via `X-Trello-Webhook` (HMAC-SHA1 over raw body + callback URL) are also accepted.
+- `TRELLO_CLIENT_IDENTIFIER`: Identifier sent in `X-Trello-Client-Identifier` on sidecar Trello writes and ignored if echoed back in incoming webhook headers. Defaults to `agy-trello-sidecar`.
+- `TRELLO_MAX_WEBHOOK_BODY_BYTES`: Maximum accepted webhook request body size in bytes before returning HTTP `413`. Defaults to `1048576` (1 MiB).
+- `TRELLO_WEBHOOK_READ_TIMEOUT_SECONDS`: Deadline in seconds for reading the incoming webhook body before returning HTTP `408`. Defaults to `10`.
+- `TRELLO_MAX_HTTP_WORKERS`: Maximum concurrent HTTP handler threads before rejecting excess requests with HTTP `503`. Defaults to `16`.
+- `TRELLO_MAX_PROMPT_BYTES`: Maximum UTF-8 byte budget for assembled `agy` prompts. Defaults to `96000` (clamped to a minimum of `16384` so required instructions and card identity remain intact).
+- `TRELLO_DEFERRED_RETRY_MAX_ATTEMPTS`: Maximum automatic deferred requeues for `READY_FOR_SPEC` triggers while live card link verification is unavailable (`trigger_deferred`). Defaults to `3`.
+- `TRELLO_DEFERRED_RETRY_DELAY_SECONDS`: Delay in seconds before requeueing a deferred `READY_FOR_SPEC` trigger. Defaults to `15`.
+- `TRELLO_ENABLE_TAILSCALE_FUNNEL`: Set to `true` only if the sidecar itself should launch `tailscale funnel` for public ingress instead of using an existing reverse proxy (such as Apache). Defaults to `false` so existing `tailscale serve` configs are untouched.
 - `TRELLO_AGENT_WORKSPACES`: A comma-separated list of paths pointing to the target directories. The agent is pinned to these directories during execution. Example:
   ```bash
   TRELLO_AGENT_WORKSPACES=/home/ubuntu/remote-hunter/remote-hunter-backend,/home/ubuntu/remote-hunter/remote-hunter-frontend
@@ -86,6 +98,7 @@ The receiver includes deterministic guardrails to prevent bot-to-bot loops and d
 
 Runtime trigger state is persisted locally under:
 `~/.gemini/antigravity-cli/trello_sidecar_state.json`
+Quarantined interrupted runs keep detailed entries (`unreconciled_cards`) up to 500 records while retaining unified per-run replay tombstones (`unreconciled_tombstones`, linking the record ID, any known `action_id`, card-scoped `delivery_keys`, and replay fingerprints together). Reconcile an interrupted run in-process while the sidecar is running via `POST /admin/reconcile` (authenticated with `X-Auth-Token` or `Authorization: Bearer <token>` and JSON body `{"actionId": "..."}`, `{"fingerprint": "..."}`, or `{"recordId": "..."}`), which clears every key on that record atomically under `state_lock`. If an `actionId` or `fingerprint` selector matches more than one quarantined run, `POST /admin/reconcile` returns HTTP `409` with `matchingRecordIds` and leaves all records blocked until you disambiguate with `recordId`. Pre-unified split-index states (`unreconciled_action_ids` and `unreconciled_fingerprints`) whose `unreconciled_cards` detail was already evicted migrate into separate `legacy-action:` and `legacy-fp:` tombstones; pass both known selectors in one `POST /admin/reconcile` request (`{"actionId": "...", "fingerprint": "..."}`) or check `remainingLegacyOrphans` in the response if one remains. Calling `reconcile_quarantined_entry(...)` directly from Python is offline-only: stop `trello-webhook.service` first so two processes cannot race on `trello_sidecar_state.json`. Relays should include Trello `actionId` or a unique delivery key (`deliveryId`, `eventId`, `webhookEventId`, or `X-Delivery-Id` / `X-Idempotency-Key` header, stored independently of refreshed card metadata); without either, replay detection uses `relay_replay_fingerprint` (card, action type, author, comment, list/label/move fields), and migrated headerless rows keep compatibility matching across replays.
 
 Structured sidecar events are appended locally under:
 `~/.gemini/antigravity-cli/trello_sidecar_events.jsonl`
@@ -158,8 +171,8 @@ Verify it is running:
 systemctl --user status trello-webhook.service
 ```
 
-### 3. Tailscale Funnel (Webhook Access)
-The receiver automatically attempts to start a **Tailscale Funnel** on port `8454` to expose the local HTTP endpoint to the internet securely. To verify the public URL, run:
+### 3. Tailscale Funnel (Optional Webhook Access)
+If you do not already terminate public HTTPS traffic through a reverse proxy (for example Apache), set `TRELLO_ENABLE_TAILSCALE_FUNNEL=true` so the receiver attempts to start a **Tailscale Funnel** on port `8454`. Otherwise Funnel stays disabled so existing `tailscale serve` listeners are unaffected. To verify Tailscale status, run:
 ```bash
 tailscale status
 ```
@@ -177,8 +190,8 @@ Conversation history for each Trello card is persisted locally under:
 
 This file maps the Trello card ID to the Antigravity conversation UUID.
 - If a card has been previously interacted with, the sidecar automatically resumes the same session by passing the `--conversation <UUID>` flag to the `agy` CLI.
-- The webhook receiver parses both short card IDs (from URLs) and long card IDs (`cardidLong` / `cardIdLong`) and automatically resolves mappings to the active thread context.
-- The receiver checks all known aliases for a card (long ID, short Trello URL ID, and card title) before starting a new conversation. It also injects a compact summary of prior files under `~/.gemini/antigravity-cli/brain/<conversation-id>/` so the agent can see earlier specs, issue bodies, and decisions tied to that card.
+- New and updated conversation UUIDs are captured from `agy --output-format stream-json` as soon as the `init` event arrives, and if a previously saved conversation was pruned or replaced, the sidecar automatically re-links all immutable ID aliases for that card to the new UUID.
+- The webhook receiver parses both short card IDs (from URLs or `card.shortLink`) and long card IDs (`cardidLong` / `cardIdLong`), canonicalizes card IDs before queuing so short and long ID webhooks share one slot, and falls back to card title only when no immutable card ID exists. It also injects a compact summary of prior files under `~/.gemini/antigravity-cli/brain/<conversation-id>/` so the agent can see earlier specs, issue bodies, and decisions tied to that card.
 
 ---
 
@@ -222,7 +235,11 @@ The sidecar should stay lightweight while behavior is still evolving. It now emi
 Current event types include:
 - `trigger_accepted`
 - `trigger_ignored`
+- `trigger_blocked`
+- `trigger_deferred`
 - `trigger_classified`
+- `trigger_requeued`
+- `trigger_interrupted_unreconciled`
 - `ack_posted`
 - `agent_run_started`
 - `conversation_linked`
@@ -242,6 +259,8 @@ Before making this repository public, scan and scrub both the working tree and g
 
 ## Security Verification Rules
 
-The prompt injected into the agent contains strict safety directives:
+- **Classifier isolation**: Semantic phase classification runs in an empty temporary working directory with `--sandbox`, a stripped environment (no Trello/GitHub/database credentials), no `--dangerously-skip-permissions`, and immediate process-group termination if any tool step or framing error occurs; any classifier tool attempt aborts the job before responder launch (`trigger_blocked`).
+- **Crash recovery safety**: Queued triggers not yet dispatched to the responder re-enqueue automatically on restart (`trigger_requeued`); runs interrupted after responder dispatch move to `unreconciled_cards` (`trigger_interrupted_unreconciled`) rather than replaying external writes automatically.
+- **Responder permissions**: `agy` 1.5.12 does not provide a selective per-tool allowlist that blocks workspace edit tools while allowing `trello_helper.py` and `gh`, so the responder runs with `--dangerously-skip-permissions` and enforces read-only workspace rules via prompt instructions.
 - **No credential leaks**: The agent is explicitly forbidden from printing, commenting, or revealing any credentials, API keys, secrets, tokens, or passwords under any circumstances.
 - This applies to Trello credentials, database passwords (like `db_reader`), `.env` secrets, or other configurations. Only the *presence* of these configurations may be verified.

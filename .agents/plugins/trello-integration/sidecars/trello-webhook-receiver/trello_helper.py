@@ -24,6 +24,8 @@ load_zshrc_env()
 
 API_KEY = os.environ.get("TRELLO_API_KEY")
 API_TOKEN = os.environ.get("TRELLO_API_TOKEN") or os.environ.get("TRELLO_TOKEN")
+AGENT_SIGNATURE_NAME = os.environ.get("TRELLO_AGENT_SIGNATURE_NAME", "Agy").strip() or "Agy"
+TRELLO_CLIENT_IDENTIFIER = os.environ.get("TRELLO_CLIENT_IDENTIFIER", "agy-trello-sidecar").strip()
 AGENT_TRELLO_USERNAME = os.environ.get("TRELLO_AGENT_TRELLO_USERNAME", "").strip().lower()
 AGENT_COMMENT_MARKER = os.environ.get("TRELLO_AGENT_COMMENT_MARKER", "<!-- [agy-sidecar:comment] -->")
 AGENT_ACK_MARKER = os.environ.get("TRELLO_AGENT_ACK_MARKER", "<!-- [agy-sidecar:ack] -->")
@@ -121,6 +123,8 @@ def make_request(url, method="GET", data=None):
         encoded_data = urllib.parse.urlencode(data).encode("utf-8")
         req.data = encoded_data
     req.add_header("Accept", "application/json")
+    if method.upper() != "GET" and TRELLO_CLIENT_IDENTIFIER:
+        req.add_header("X-Trello-Client-Identifier", TRELLO_CLIENT_IDENTIFIER)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode("utf-8")), None
@@ -144,6 +148,12 @@ def sanitize_forbidden_mentions(text):
             flags=re.IGNORECASE,
         )
     return sanitized
+
+def ensure_agent_signature(text):
+    sig_pattern = rf"(?im)^\s*-\s*Love\s+{re.escape(AGENT_SIGNATURE_NAME)}\s*$"
+    if re.search(sig_pattern, text or ""):
+        return text
+    return (text or "").rstrip() + f"\n\n- Love {AGENT_SIGNATURE_NAME}"
 
 def ensure_agent_comment_marker(text):
     legacy_markers = ["[agy-sidecar:comment]", "[agy-sidecar:ack]", "[agy-sidecar:status]"]
@@ -173,7 +183,7 @@ def find_list_id(card_id, list_name):
         return None, f"Failed to get board lists: {err}"
         
     for lst in lists:
-        if lst.get("name").strip().lower() == list_name.strip().lower():
+        if (lst.get("name") or "").strip().lower() == list_name.strip().lower():
             return lst.get("id"), None
             
     return None, f"List '{list_name}' not found on board"
@@ -196,13 +206,14 @@ def find_label_id(card_id, label_name):
         return None, f"Failed to get board labels: {err}"
         
     for lbl in labels:
-        if lbl.get("name").strip().lower() == label_name.strip().lower():
+        if (lbl.get("name") or "").strip().lower() == label_name.strip().lower():
             return lbl.get("id"), None
             
     return None, f"Label '{label_name}' not found on board"
 
 def cmd_comment(card_id, text):
     text = sanitize_forbidden_mentions(text)
+    text = ensure_agent_signature(text)
     text = ensure_agent_comment_marker(text)
     url = f"https://api.trello.com/1/cards/{trello_path_id(card_id)}/actions/comments?key={API_KEY}&token={API_TOKEN}"
     res, err = make_request(url, method="POST", data={"text": text})
